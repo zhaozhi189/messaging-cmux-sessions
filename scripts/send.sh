@@ -17,6 +17,7 @@
 #   send.sh <目标> --ask <消息>              需回复的请求:生成关联号,投递前落台账
 #   send.sh <目标> --reply <corr> <消息>     回复某条请求:投递成功后自动消对方台账
 #   send.sh <目标> --flush '<消息开头几个字>'  目标空闲后,补交卡在它输入框里的消息
+#   send.sh <目标> --peek                    探测目标输入框:空 / 真卡箱 / ghost text
 #   send.sh --list                          列出所有可寻址会话
 #   (台账查询/手动消账见同目录 pending.sh)
 #
@@ -31,10 +32,11 @@
 #   CMUX_MSG_DIR  台账/忙闲状态目录(默认 ~/.claude/cmux-messaging)
 #
 # 退出码:
-#   0  已确认提交(或目标已明确排队)
+#   0  已确认提交(或目标已明确排队);--peek 时 = 箱空(含 ghost text)
 #   1  没找到目标会话
 #   2  目标忙,消息留在其输入框(可能已被 TUI 排队)—— 先重查再决定是否 --flush
-#   3  多次补 CR 仍残留,需人工查看
+#      --peek 时 = 箱里确有未提交文本
+#   3  多次补 CR 仍残留,需人工查看;--peek 时 = 目标忙,无法探测
 #   4  用法错误 / 目标不明确(标题重名)
 #   5  目标没有 agent 输入框(死壳/普通 shell)—— 给 shell 执行命令请用裸 cmux send
 #
@@ -128,13 +130,14 @@ fi
 TARGET="$1"; shift
 [ $# -ge 1 ] || die "缺少消息文本"
 
-ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""
+ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""; PEEK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --flush)   FLUSH_SIG="${2:-}"; [ -n "$FLUSH_SIG" ] || die "--flush 缺少签名参数"; shift 2 ;;
     --no-from) ADD_FROM=0; shift ;;
     --dry-run) DRY=1; shift ;;
     --ask)     ASK=1; shift ;;
+    --peek)    PEEK=1; shift ;;
     --reply)   REPLY_CORR="${2:-}"; [ -n "$REPLY_CORR" ] || die "--reply 缺少关联号参数"; shift 2 ;;
     *)         MSG="$1"; shift ;;
   esac
@@ -204,6 +207,39 @@ if [ -n "$FLUSH_SIG" ]; then
   fi
   # 空箱补 \r 会让 TUI 重放上一条输入(实测重跑过整条 brief),所以签名不匹配就什么都不做。
   echo "✓ 箱内无该消息(已提交或从未卡箱),无需 flush。当前输入框: $(box_line)"; exit 0
+fi
+
+# ── --peek:目标输入框里到底有没有「真的」未提交文本?────────────────────────
+#    Claude Code 会在空输入框显示灰色历史建议词(ghost text),read-screen 拿到的
+#    纯文本与卡箱文本无法直接区分——曾诱导对空箱反复 --flush 而不自知(2026-08-29 踩)。
+#    判据:注入一个空格再退格,净效应为零。真文本注入后仍在(只是多个尾空格);
+#    ghost 是"影子",一有真实输入就消失/改变。仅在目标空闲时探测——忙时注入会打扰,
+#    且屏幕在滚动,读数不稳。
+if [ "$PEEK" = 1 ]; then
+  if is_busy "$(read_tail 40)"; then
+    echo "? 目标忙,不探测(忙时注入会打扰,读数也不稳)。等空闲再试: watch.sh idle $TARGET"
+    exit 3
+  fi
+  line=$(box_line)
+  [ -n "$line" ] || { echo "✗ 目标 $ref($tgt_title)没有 agent 输入框(❯/›)。" >&2; exit 5; }
+  txt=$(printf '%s' "$line" | sed -E 's/.*[❯›][[:space:]]*//; s/[[:space:]]+$//')
+  if [ -z "$txt" ]; then
+    echo "✓ 箱空:$ref($tgt_title)输入框没有未提交文本。"
+    exit 0
+  fi
+  "$CMUX" send --window "$win" --surface "$ref" ' ' >/dev/null
+  sleep 1
+  after=$(box_line)
+  "$CMUX" send --window "$win" --surface "$ref" "$(printf '\177')" >/dev/null
+  if printf '%s' "$after" | grep -qF "$txt"; then
+    echo "⚠ 真卡箱:$ref($tgt_title)输入框有未提交文本(注入探针后仍在):"
+    echo "   $txt"
+    echo "   确认是你发的消息后补交: $0 $TARGET --flush '<该文本开头几个字>'"
+    exit 2
+  fi
+  echo "✓ ghost text:注入探针后文本消失——箱里其实是空的,不要 flush。"
+  echo "   (刚才看到的是 Claude Code 的灰色历史建议词: $txt)"
+  exit 0
 fi
 
 [ -n "$MSG" ] || die "缺少消息文本"

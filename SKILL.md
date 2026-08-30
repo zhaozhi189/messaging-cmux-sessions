@@ -189,7 +189,7 @@ $CMUX read-screen --window <w> --surface <ref> --lines 40
 - **卡住(未提交)** → 文本还跟在 `❯` 后 → 补一个 `\r`。**读 ≥40 行**,只读末尾几行会被状态栏挤掉 `❯` 行,误判为"已提交"。
 - **⭐ 语义忙闲优先(hooks 权威源)**:Claude Code 会话的忙闲状态由 hooks 写入 `~/.claude/cmux-messaging/busy/surface_N`(`UserPromptSubmit→busy`,`Stop→idle`,`SessionEnd→删除`;见 `scripts/busy-hook.sh`)。判忙先读这个文件:`state=busy` 就是忙、`state=idle` 就是闲,**不用再刮屏猜**。文件缺失/超 2h = unknown——unknown 绝不当 idle 用,退回下面的读屏启发式。Codex 等无 hooks 的目标永远走读屏。`send.sh` 已内置这套优先级。
 - **忙(读屏启发式,仅语义状态 unknown 时用)** → 末尾出现 `esc to interrupt`,或一条**进行时** spinner 行(`Noodling…` / `Simmering…` / `Baking…`——这是**开放集**,会冒新词,匹配尾部 `…` + 耗时,别用固定词表)。`Brewed for` / `Cogitated for` 是**过去式** = 已完成 = 空闲。⚠️ 带 `--scrollback` 读屏时只看**末尾 ~15 行**,更早的历史里全是过期的忙碌行。
-- **⚠️ Ghost text**:Claude Code 输入框会显示灰色**建议词**,读屏时与卡箱文本无法区分——所以判成功一律用**消息开头签名**匹配,不要用"箱里有没有字"。
+- **⚠️ Ghost text**:Claude Code 输入框会显示灰色**建议词**,读屏时与卡箱文本无法区分——所以判成功一律用**消息开头签名**匹配,不要用"箱里有没有字"。想明确知道"对方箱里到底有没有东西",别读屏猜,用 **`send.sh <目标> --peek`**:它注入一个空格再退格(净效应为零),真文本注入后仍在、ghost 一有真实输入就消失。退出码 `0` 箱空(含 ghost)/ `2` 真卡箱 / `3` 目标忙无法探测。
 - **⚠️ read-screen 是单次瞬时快照。** 轮询时某次快照恰好落在两次工具调用之间,会拍到瞬间的空 `❯`、误判为空闲。要么连续 2 次读都空闲才算,要么盯**带外信号**:目标仓库的 `git log` HEAD 变化、某文件被写、或 `~/.cmuxterm/claude-hook-sessions.json` 里对应 `surfaceId` 的 `lastSubtitle: Waiting`。
 - **⚠️ 空闲 ≠ 卡住。** 空的 `❯` 且无 spinner,常意味着 agent **做完了、在等你回答**(它提了问题)。补 `\r` / 重发前先读 ≥30 行看它最后一句是不是提问,否则会把它带跑。
 
@@ -259,6 +259,7 @@ $S/watch.sh idle <目标> --once              # 调试:只判一次忙闲,不后
 | 长消息只提交了最后一行 | wrap 成多行后 `\r` 只提交一个可视行 | 别追着补——清空箱,改用**写文件 + 发指针** |
 | **消息没超字数闸门却仍卡箱** | 闸门旧版按**字符数**判、阈值固定 260;终端按**显示列**换行且中文占 2 列 —— 153 字符可以是 159 列 | 已修:按显示列宽判、阈值取目标终端真实宽度。旧版请升级 `send.sh` |
 | **对方的回复始终没到你这** | 对方发回复时**没带 `\r`** → 卡在**你的**输入框 | `read-screen` 你自己的 surface,补一个 `\r` 吃进来 |
+| **`--flush` 反复无效,且目标一直 idle** | 箱里根本没有东西——你看到的是 **ghost text**(灰色历史建议词),读屏与卡箱文本长得一样 | 别再 flush。用 `send.sh <目标> --peek` 确证:退出码 0 = 箱空(ghost),2 = 真卡箱 |
 | 消息发给了错误的会话 | 多个 tab 标题重名/相似,旧逻辑静默取第一个 | 用 `send.sh`(重名直接拒绝并列候选);给 tab 起唯一名字 |
 | Ctrl+U / 退格清不干净 | TUI **吞掉批量按键**,只有部分生效 | 趁目标空闲重复 2-3 轮退格洪流(见下) |
 | 全新 surface 读屏报 `internal_error: Failed to read terminal text` | **首次 `send` 写入前**,read-screen 必失败(任何 --lines、等多久都一样);首次写入后永久可读 | 就绪探测用 `list-panes`(结构化检查,无此坑),别用读屏 |
@@ -306,6 +307,7 @@ $S/watch.sh idle <目标> --flush '<签名>'            # 零 token 等空闲+�
 $S/watch.sh overdue                                # 值班盯台账账龄,超龄唤醒催办
 $S/watch.sh list                                   # watcher 状态 + 未送达唤醒
 $S/send.sh <目标> --flush '<签名>'                  # 退出码 2 之后补交
+$S/send.sh <目标> --peek                           # 对方箱里有没有东西?(区分 ghost text)
 $S/send.sh <目标> '<消息>' --dry-run                # 只看定位结果,不发
 $CMUX read-screen --window <w> --surface <ref> --scrollback --lines 40   # 验证 / 判忙闲
 cat ~/.claude/cmux-messaging/busy/surface_N             # 语义忙闲(hooks 写入)
