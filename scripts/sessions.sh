@@ -52,7 +52,7 @@ rows=$(surfaces)
 
 if [ -n "$QUERY" ]; then
   # 单值查询:给脚本/审计循环用,输出干净的一行
-  tab=$(awk -F'|' -v k="$QUERY" '
+  tab=$(LC_ALL=C awk -F'|' -v k="$QUERY" '
     function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
     /^[ \t]*#/ || /^[ \t]*$/ { next }
     trim($1) == k { print trim($2) "\t" trim($3); exit }' "$REGISTRY" 2>/dev/null || true)
@@ -61,7 +61,7 @@ if [ -n "$QUERY" ]; then
   if [ "$QUERY_FIELD" = repo ]; then
     printf '%s\n' "${repo/#\~/$HOME}"
   else
-    printf '%s\n' "$rows" | awk -F'|' -v t="$title" '$4 == t { print $1; exit }'
+    printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v t="$title" '$4 == t { print $1; exit }'
   fi
   exit 0
 fi
@@ -83,7 +83,7 @@ fi
 
 # 注册表视图:别名 → 在线状态 → 仓库,按注册表顺序输出
 printf 'ALIAS\tSURFACE\tTITLE\tGROUP\tREPO%s\n' "$([ "$WANT_STATUS" = 1 ] && printf '\tSTATUS')"
-printf '%s\n' "$rows" | awk -F'|' -v reg="$REGISTRY" -v group="$GROUP" '
+printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v reg="$REGISTRY" -v group="$GROUP" '
   function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
   { ref[$4] = $1; win[$4] = $2 }          # 以 tab 标题为连接键
   END {

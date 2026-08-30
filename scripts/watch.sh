@@ -120,7 +120,7 @@ EOF
 # 默认只盯"我发出的";--group 时盯"组内成员发出的"(OVERDUE_SCOPE = 别名+标题列表)
 in_overdue_scope() {  # <from>
   if [ -n "${OVERDUE_SCOPE:-}" ]; then
-    printf '%s\n' "$OVERDUE_SCOPE" | grep -qxF "$1"
+    printf '%s\n' "$OVERDUE_SCOPE" | LC_ALL=C grep -qxF "$1"
   else
     [ -n "$ME" ] && [ "$1" = "$ME" ]
   fi
@@ -169,7 +169,7 @@ resolve_one() {  # <目标>
 group_members() {  # <组名>
   local reg="${CMUX_SESSIONS_CONF:-$HOME/.claude/cmux-sessions.conf}"
   [ -f "$reg" ] || return 1
-  awk -F'|' -v g="$1" '
+  LC_ALL=C awk -F'|' -v g="$1" '
     function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
     /^[ \t]*#/ || /^[ \t]*$/ { next }
     trim($4) == g { print trim($1) }' "$reg"
@@ -240,7 +240,7 @@ case "$CMD" in
     if [ -n "$GROUP" ] && [ -z "${OVERDUE_SCOPE:-}" ]; then
       reg="${CMUX_SESSIONS_CONF:-$HOME/.claude/cmux-sessions.conf}"
       [ -f "$reg" ] || die "✗ 找不到注册表 $reg——--group 依赖它确定组成员"
-      OVERDUE_SCOPE=$(awk -F'|' -v g="$GROUP" '
+      OVERDUE_SCOPE=$(LC_ALL=C awk -F'|' -v g="$GROUP" '
         function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
         /^[ \t]*#/ || /^[ \t]*$/ { next }
         trim($4) == g { print trim($1); print trim($2) }' "$reg" | sort -u)

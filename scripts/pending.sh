@@ -36,13 +36,13 @@ done
 MEMBERS=""
 if [ -n "$GROUP" ]; then
   [ -f "$REGISTRY" ] || { echo "✗ 找不到注册表 $REGISTRY——--group 依赖它确定组成员" >&2; exit 2; }
-  MEMBERS=$(awk -F'|' -v g="$GROUP" '
+  MEMBERS=$(LC_ALL=C awk -F'|' -v g="$GROUP" '
     function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
     /^[ \t]*#/ || /^[ \t]*$/ { next }
     trim($4) == g { print trim($1); print trim($2) }' "$REGISTRY" | sort -u)
   [ -n "$MEMBERS" ] || { echo "✗ 组 '$GROUP' 里没有成员" >&2; exit 2; }
 fi
-in_scope() { [ -z "$MEMBERS" ] || printf '%s\n' "$MEMBERS" | grep -qxF "$1"; }
+in_scope() { [ -z "$MEMBERS" ] || printf '%s\n' "$MEMBERS" | LC_ALL=C grep -qxF "$1"; }
 
 case "$cmd" in
   list)

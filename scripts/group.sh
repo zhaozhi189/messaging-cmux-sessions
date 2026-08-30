@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-members=$(awk -F'|' -v g="$GROUP" '
+members=$(LC_ALL=C awk -F'|' -v g="$GROUP" '
   function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
   /^[ \t]*#/ || /^[ \t]*$/ { next }
   trim($4) == g { print trim($1) }

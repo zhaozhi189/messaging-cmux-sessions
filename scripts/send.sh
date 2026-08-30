@@ -73,7 +73,7 @@ list_surfaces() {
 # 格式(| 分隔,# 开头为注释):  别名 | tab标题 | 仓库路径 | 分组 | 说明
 registry_lookup() {
   [ -f "$REGISTRY" ] || return 1
-  awk -F'|' -v key="$1" '
+  LC_ALL=C awk -F'|' -v key="$1" '
     function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
     /^[ \t]*#/ || /^[ \t]*$/ { next }
     trim($1) == key { print trim($2); found = 1; exit }
@@ -91,10 +91,10 @@ resolve() {
 
   local hit
   if printf '%s' "$want" | grep -qE '^surface:[0-9]+$'; then
-    hit=$(printf '%s\n' "$rows" | awk -F'|' -v r="$want" '$1 == r')
+    hit=$(printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v r="$want" '$1 == r')
   else
-    hit=$(printf '%s\n' "$rows" | awk -F'|' -v t="$want" '$4 == t')
-    [ -z "$hit" ] && hit=$(printf '%s\n' "$rows" | awk -F'|' -v t="$want" 'index($4, t) > 0')
+    hit=$(printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v t="$want" '$4 == t')
+    [ -z "$hit" ] && hit=$(printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v t="$want" 'index($4, t) > 0')
   fi
 
   [ -z "$hit" ] && { echo "✗ 未找到会话: $want" >&2; echo "   可用会话:" >&2

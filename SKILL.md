@@ -279,6 +279,7 @@ $S/watch.sh idle <目标> --once              # 调试:只判一次忙闲,不后
 | **对方的回复始终没到你这** | 对方发回复时**没带 `\r`** → 卡在**你的**输入框 | `read-screen` 你自己的 surface,补一个 `\r` 吃进来 |
 | **`--flush` 反复无效,且目标一直 idle** | 箱里根本没有东西——你看到的是 **ghost text**(灰色历史建议词),读屏与卡箱文本长得一样 | 别再 flush。用 `send.sh <目标> --peek` 确证:退出码 0 = 箱空(ghost),2 = 真卡箱 |
 | 消息发给了错误的会话 | 多个 tab 标题重名/相似,旧逻辑静默取第一个 | 用 `send.sh`(重名直接拒绝并列候选);给 tab 起唯一名字 |
+| **中文标题/组名匹配错乱** | macOS awk 的字符串比较走 locale collation,UTF-8 locale 下**不同的中文串会被判为相等**(实测「已定」==「在做什么」为真) | 脚本已修:所有标题/别名/组名比较一律 `LC_ALL=C` 按字节;自己写脚本比较中文时同样要加 |
 | Ctrl+U / 退格清不干净 | TUI **吞掉批量按键**,只有部分生效 | 趁目标空闲重复 2-3 轮退格洪流(见下) |
 | 全新 surface 读屏报 `internal_error: Failed to read terminal text` | **首次 `send` 写入前**,read-screen 必失败(任何 --lines、等多久都一样);首次写入后永久可读 | 就绪探测用 `list-panes`(结构化检查,无此坑),别用读屏 |
 | 隔天按缓存的 id 发错 / 发不出 | workspace/surface **UUID 不跨 cmux 重启存活**(重启后全部重新生成) | 绝不缓存 id 过夜;每次按标题/别名重新解析(`send.sh` 每次都全量重解析) |
