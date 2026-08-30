@@ -117,9 +117,18 @@ EOF
 }
 
 # ── overdue:盯台账账龄 ───────────────────────────────────────────────────────
+# 默认只盯"我发出的";--group 时盯"组内成员发出的"(OVERDUE_SCOPE = 别名+标题列表)
+in_overdue_scope() {  # <from>
+  if [ -n "${OVERDUE_SCOPE:-}" ]; then
+    printf '%s\n' "$OVERDUE_SCOPE" | grep -qxF "$1"
+  else
+    [ -n "$ME" ] && [ "$1" = "$ME" ]
+  fi
+}
 run_overdue() {
-  local me start now f corr from to ts age
-  me=$(self_title); [ -n "$me" ] || exit 0
+  local start now f corr from ts age
+  ME=$(self_title)
+  [ -n "$ME" ] || [ -n "${OVERDUE_SCOPE:-}" ] || exit 0
   start=$(date +%s)
   while :; do
     now=$(date +%s)
@@ -128,12 +137,12 @@ run_overdue() {
       [ -e "$f" ] || continue
       corr=$(basename "$f")
       from=$(awk -F= '$1=="from"{print $2; exit}' "$f")
-      [ "$from" = "$me" ] || continue
+      in_overdue_scope "$from" || continue
       [ -f "$WDIR/nagged-$corr" ] && continue
       ts=$(awk -F= '$1=="ts"{print $2; exit}' "$f"); ts=${ts:-$now}
       age=$(( (now - ts) / 60 ))
       if [ "$age" -ge "$AGE_MIN" ]; then
-        if notify "发给 $(awk -F= '$1=="to"{print $2; exit}' "$f") 的请求 $corr 已挂 ${age} 分钟未回——考虑催一下(读对方屏幕看卡在哪)或升级给用户。"; then
+        if notify "${GROUP:+[组 $GROUP] }$from 发给 $(awk -F= '$1=="to"{print $2; exit}' "$f") 的请求 $corr 已挂 ${age} 分钟未回——考虑催一下(读对方屏幕看卡在哪)或升级给用户。"; then
           touch "$WDIR/nagged-$corr"
         fi
       fi
@@ -217,24 +226,35 @@ case "$CMD" in
     fi
     ;;
   overdue)
-    AGE_MIN="${AGE_MIN:-30}"; TIMEOUT="${TIMEOUT:-14400}"; ONCE=0
+    AGE_MIN="${AGE_MIN:-30}"; TIMEOUT="${TIMEOUT:-14400}"; GROUP="${GROUP:-}"; ONCE=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --age)     AGE_MIN="${2:-}"; shift 2 ;;
         --timeout) TIMEOUT="${2:-}"; shift 2 ;;
+        --group)   GROUP="${2:-}"; [ -n "$GROUP" ] || die "--group 缺少组名"; shift 2 ;;
         --once)    ONCE=1; shift ;;
         *) die "未知选项: $1" ;;
       esac
     done
+    # 组模式:盯的范围从"我发出的"扩成"组内成员发出的"(台账 from 记 tab 标题,别名一并算上)
+    if [ -n "$GROUP" ] && [ -z "${OVERDUE_SCOPE:-}" ]; then
+      reg="${CMUX_SESSIONS_CONF:-$HOME/.claude/cmux-sessions.conf}"
+      [ -f "$reg" ] || die "✗ 找不到注册表 $reg——--group 依赖它确定组成员"
+      OVERDUE_SCOPE=$(awk -F'|' -v g="$GROUP" '
+        function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+        /^[ \t]*#/ || /^[ \t]*$/ { next }
+        trim($4) == g { print trim($1); print trim($2) }' "$reg" | sort -u)
+      [ -n "$OVERDUE_SCOPE" ] || die "✗ 组 '$GROUP' 里没有成员"
+    fi
     if [ "$ONCE" = 1 ]; then
-      me=$(self_title); now=$(date +%s); found=0
+      ME=$(self_title); now=$(date +%s); found=0
       for f in "$MSGDIR"/pending/*; do
         [ -e "$f" ] || continue
         from=$(awk -F= '$1=="from"{print $2; exit}' "$f")
         ts=$(awk -F= '$1=="ts"{print $2; exit}' "$f"); ts=${ts:-$now}
         age=$(( (now - ts) / 60 ))
         printf '判定: %s from=%s 账龄=%smin %s\n' "$(basename "$f")" "$from" "$age" \
-          "$([ "$from" = "$me" ] && [ "$age" -ge "$AGE_MIN" ] && echo '→ 会触发催办' || echo '→ 不触发')"
+          "$(in_overdue_scope "$from" && [ "$age" -ge "$AGE_MIN" ] && echo '→ 会触发催办' || echo '→ 不触发')"
         found=1
       done
       [ "$found" = 0 ] && echo "判定: 台账为空"
@@ -300,6 +320,7 @@ case "$CMD" in
            GROUP="$GROUP" TARGET="$TARGET" TGT_LIST="$TGT_LIST" WATCH_DESC="$WATCH_DESC" \
            nohup "$0" idle >>"$LOG" 2>&1 & ;;
   overdue) WATCH_FG=1 AGE_MIN="$AGE_MIN" TIMEOUT="$TIMEOUT" \
+           GROUP="$GROUP" OVERDUE_SCOPE="${OVERDUE_SCOPE:-}" \
            nohup "$0" overdue >>"$LOG" 2>&1 & ;;
 esac
 echo $! > "$LOCK"
