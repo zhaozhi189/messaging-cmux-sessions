@@ -43,7 +43,7 @@
 | **cmux** | ≥ 0.64(按 0.64.10 校准) | `cmux version` |
 | 调用位置 | **必须在 cmux 的终端内** | `cmux identify` 能打出 `caller` |
 | shell | bash 3.2+(macOS 自带即可) | — |
-| 其他 | 只用 `awk` / `grep` / `sed`,**无需 jq、python** | — |
+| 其他 | `awk` / `grep` / `sed`;`python3` 仅用于长消息闸门的显示列宽计算(缺失时退化为字符数判断),**无需 jq** | — |
 
 没装 cmux 的话:cmux 是一个多会话终端(把每个 AI 编码会话跑成独立 tab),先装它、把你的会话搬进去,本 skill 才有意义。`cmux` 二进制通常在 `/Applications/cmux.app/Contents/Resources/bin/cmux`,脚本会自动回退到这个路径。
 
@@ -85,7 +85,7 @@ $S/send.sh demo-frontend '接口已定稿' --dry-run
 $S/send.sh demo-frontend '接口已定稿,详见 /tmp/api-v2.md'
 ```
 
-退出码就是你的重发循环:`0` 已提交 / `1` 没找到 / `2` 目标忙(空闲后 `--flush` 补交)/ `3` 需人工看 / `4` 用法错或标题重名。
+退出码就是你的重发循环:`0` 已提交 / `1` 没找到 / `2` 目标忙(空闲后 `--flush` 补交)/ `3` 需人工看 / `4` 用法错、标题重名或消息超宽 / `5` 目标没有 agent 输入框(死壳)。
 
 ## 全局项目配置(跨会话关联)
 
@@ -160,11 +160,30 @@ messaging-cmux-sessions/
 ├── PITCH.md                        # 对外介绍文案(三种长度)+ 3 分钟演示脚本
 ├── cmux-sessions.example.conf      # 全局注册表样例
 ├── references/
-│   └── collaboration-patterns.md   # 进阶:文件信箱+ack、旁路审计、扇出编排
+│   └── collaboration-patterns.md   # 进阶:文件信箱+ack、旁路审计、组看板、协作约定
 └── scripts/
-    ├── send.sh                     # 定位 + 查空闲 + 发送 + 验证 + 补 CR
-    └── sessions.sh                 # 会话发现 + 项目关联(在线/忙闲/仓库路径)
+    ├── send.sh                     # 定位 + 查空闲 + 发送 + 验证 + 补 CR;--peek 探测卡箱
+    ├── sessions.sh                 # 会话发现 + 项目关联(在线/忙闲/仓库路径)
+    ├── group.sh                    # 按注册表分组广播,汇总每人投递结果
+    ├── board.sh                    # 组共享看板:谁在做什么 / 待决 / 已定(决策落盘)
+    ├── pending.sh                  # 待回复台账(send.sh --ask 的账);--group 组级视图
+    ├── watch.sh                    # 零 token 看护:等空闲 / 盯账龄,条件满足注入唤醒
+    └── busy-hook.sh                # Claude Code hooks 回调:写语义化忙/闲状态
 ```
+
+## 多会话协作(3 个以上)
+
+两两消息是 O(N²),且没人有全局视图。三件套:
+
+```bash
+$S/group.sh <组> '<消息>'             # 广播通知(契约变更、环境挂了),汇总投递结果
+$S/board.sh <组>                     # 共享看板:谁在做什么 / 待决 / 已定
+$S/pending.sh list --group <组>      # 组级台账:谁欠谁的回复,带账龄
+$S/watch.sh idle --group <组>        # 组内任一成员空闲就唤醒协调者
+```
+
+**广播只用于「通知」,派活用「写文件 + 发指针 + `--ask` 台账」**;对话里定下的决策
+当场 `board.sh --decide` 落盘——「已定」栏是唯一真相源。详见 `references/collaboration-patterns.md`。
 
 ## 故障排查
 
