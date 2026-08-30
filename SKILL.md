@@ -230,9 +230,10 @@ cmux 消息是**双向、多轮的,不是发完即弃**。对方往你的 surfac
 $S/watch.sh idle <目标> --flush '<签名>'    # send.sh 退出码 2 的标准后续:
                                             # 等目标空闲 → 自动补交卡箱消息 → 唤醒我核实
 $S/watch.sh idle <目标> --note '干完活了叫我看结果'   # 等对方跑完长任务
+$S/watch.sh idle --group <组>               # 协调者:组内任一成员空闲就唤醒,并说明是谁
 $S/watch.sh overdue --age 30                # 值班 4h:我发出的 --ask 挂超 30min 就叫醒我去催
 $S/watch.sh list                            # 活着的 watcher + 未送达的唤醒
-$S/watch.sh stop [idle|overdue|all]         # 停止
+$S/watch.sh stop [idle|overdue|all]         # 停止(stop idle 停掉全部 idle watcher)
 $S/watch.sh idle <目标> --once              # 调试:只判一次忙闲,不后台化不注入
 ```
 
@@ -241,7 +242,7 @@ $S/watch.sh idle <目标> --once              # 调试:只判一次忙闲,不后
 - 收到 `[watcher]` 开头的消息 = 看护条件满足了,按消息内容行动;
 - **醒来时 `watch.sh list` 里出现"⚠️ 未送达的唤醒"** = watcher 尝试注入失败(多半 cmux 重启导致 ref 失效),队列文件里是它想告诉你的话——读完处理掉;
 - 判忙口径与 send.sh 一致(语义状态文件优先,unknown 读屏),连续 2 次判闲才触发,防单次快照误判;
-- 每会话每类型只允许一个 watcher(重复启动会被拒),超时自动下岗(idle 默认 30min 且会唤醒告知,overdue 默认 4h 静默退出)。
+- **idle watcher 按(会话,目标)记一个**——同时盯多个目标就启动多个,互不挤占;同一目标重复启动才会被拒。协调者盯全组用 `idle --group <组>`,别为每个成员起一个再手动轮换。overdue 每会话一个。超时自动下岗(idle 默认 30min 且会唤醒告知,overdue 默认 4h 静默退出)。
 
 ## 进阶:可靠闭环与多会话编排
 

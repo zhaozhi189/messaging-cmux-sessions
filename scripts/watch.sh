@@ -11,10 +11,15 @@
 #       等目标空闲(连续 2 次判闲,防单次快照误判)→ 有 --flush 先补交卡箱消息 → 唤醒我。
 #       典型场景:send.sh 退出码 2(目标忙)之后接一句:
 #         watch.sh idle <目标> --flush '<签名>'
-#   watch.sh overdue [--age <分钟,默认30>] [--timeout <秒,默认14400>]
+#       idle watcher 按(会话,目标)记一个——同时盯多个目标就启动多个,互不挤占。
+#   watch.sh idle --group <组> [--timeout] [--note]
+#       盯整个协作组:组内**任一成员**空闲就唤醒,并在唤醒消息里说明是谁。
+#       协调者语义:不用在多个目标之间反复 stop/start 单目标 watcher。
+#   watch.sh overdue [--age <分钟,默认30>] [--timeout <秒,默认14400>] [--group <组>]
 #       盯台账:我发出的 --ask 请求账龄超标且未提醒过 → 唤醒我去催办。每条只提醒一次。
+#       --group 把范围从"我发出的"扩成"组内成员发出的"(组级视角,配 pending.sh --group)。
 #   watch.sh list                     列出活着的 watcher
-#   watch.sh stop [idle|overdue|all]  停止本会话的 watcher
+#   watch.sh stop [idle|overdue|all]  停止本会话的 watcher(idle 会停掉全部 idle watcher)
 #
 # 选项:
 #   --once   只做一轮条件检查并打印判断结果,不后台化、不注入(调试用)
@@ -70,26 +75,43 @@ notify() {  # <消息> —— 注入失败(如 cmux 重启导致 ref 失效)时�
   done
 }
 
-# ── idle:等目标空闲 ──────────────────────────────────────────────────────────
+# ── idle:等目标空闲(单目标或组内任一成员;TGT_LIST 每行 ref|win|title)────────
 run_idle() {
-  local streak=0 start now
+  local start now i n ref win title
+  local refs=() wins=() titles=() streaks=()
+  while IFS='|' read -r ref win title; do
+    [ -n "$ref" ] || continue
+    refs+=("$ref"); wins+=("$win"); titles+=("$title"); streaks+=(0)
+  done <<EOF
+$TGT_LIST
+EOF
+  n=${#refs[@]}
   start=$(date +%s)
   while :; do
     now=$(date +%s)
     if [ $(( now - start )) -ge "$TIMEOUT" ]; then
-      notify "等待 $TGT_TITLE 空闲已超时($(( TIMEOUT / 60 ))min),放弃看护。${NOTE:+备注: $NOTE}" || true
+      notify "等待 $WATCH_DESC 空闲已超时($(( TIMEOUT / 60 ))min),放弃看护。${NOTE:+备注: $NOTE}" || true
       exit 0
     fi
-    if busy_of "$TGT_REF" "$TGT_WIN"; then streak=0; else streak=$(( streak + 1 )); fi
-    if [ "$streak" -ge 2 ]; then
-      if [ -n "$FLUSH_SIG" ]; then
-        "$S_DIR/send.sh" "$TGT_REF" --flush "$FLUSH_SIG" >/dev/null 2>&1 || true
-        notify "$TGT_TITLE 已空闲,已尝试补交卡箱消息(签名 $FLUSH_SIG),请核实。${NOTE:+备注: $NOTE}" || true
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      if busy_of "${refs[$i]}" "${wins[$i]}"; then
+        streaks[$i]=0
       else
-        notify "$TGT_TITLE 已空闲。${NOTE:+备注: $NOTE}" || true
+        streaks[$i]=$(( ${streaks[$i]} + 1 ))
       fi
-      exit 0
-    fi
+      # 连续 2 次判闲才触发,防单次快照误判;组模式下先闲下来的成员先唤醒
+      if [ "${streaks[$i]}" -ge 2 ]; then
+        if [ -n "$FLUSH_SIG" ]; then
+          "$S_DIR/send.sh" "${refs[$i]}" --flush "$FLUSH_SIG" >/dev/null 2>&1 || true
+          notify "${titles[$i]} 已空闲,已尝试补交卡箱消息(签名 $FLUSH_SIG),请核实。${NOTE:+备注: $NOTE}" || true
+        else
+          notify "${titles[$i]} 已空闲${GROUP:+(组 $GROUP 中最先空闲的成员)}。${NOTE:+备注: $NOTE}" || true
+        fi
+        exit 0
+      fi
+      i=$(( i + 1 ))
+    done
     sleep 10
   done
 }
@@ -122,31 +144,75 @@ run_overdue() {
 
 # ── 参数解析与调度 ────────────────────────────────────────────────────────────
 CMD="${1:-}"; shift || true
-LOCK="$WDIR/${SELF_REF//:/_}-$CMD.pid"
+
+# 复用 send.sh 的目标解析(别名/标题/子串/重名拒绝),输出一行 ref|win|title
+resolve_one() {  # <目标>
+  local line ref win title
+  line=$(SEND_SELF_OK=1 "$S_DIR/send.sh" "$1" --dry-run x 2>&1 | head -1) || return 1
+  ref=$(printf '%s' "$line" | sed -n 's/^目标: \(surface:[0-9]*\) .*/\1/p')
+  win=$(printf '%s' "$line" | sed -n 's/.*(\(window:[0-9]*\),.*/\1/p')
+  title=$(printf '%s' "$line" | sed -n 's/.*, \(.*\))$/\1/p')
+  [ -n "$ref" ] && [ -n "$win" ] || return 1
+  printf '%s|%s|%s' "$ref" "$win" "$title"
+}
+
+# 从注册表取组成员别名(与 group.sh 同口径)
+group_members() {  # <组名>
+  local reg="${CMUX_SESSIONS_CONF:-$HOME/.claude/cmux-sessions.conf}"
+  [ -f "$reg" ] || return 1
+  awk -F'|' -v g="$1" '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    /^[ \t]*#/ || /^[ \t]*$/ { next }
+    trim($4) == g { print trim($1) }' "$reg"
+}
 
 case "$CMD" in
   idle)
-    TARGET="${1:-}"; [ -n "$TARGET" ] && [ "${TARGET#--}" = "$TARGET" ] || die "用法: watch.sh idle <目标> [--flush '<签名>'] [--timeout 秒] [--note '...'] [--once]"
-    shift
     # 默认值取自环境:后台重入(WATCH_FG=1)时选项经环境变量传递,不能被重置
-    FLUSH_SIG="${FLUSH_SIG:-}"; TIMEOUT="${TIMEOUT:-1800}"; NOTE="${NOTE:-}"; ONCE=0
+    FLUSH_SIG="${FLUSH_SIG:-}"; TIMEOUT="${TIMEOUT:-1800}"; NOTE="${NOTE:-}"
+    GROUP="${GROUP:-}"; TARGET="${TARGET:-}"; ONCE=0
     while [ $# -gt 0 ]; do
       case "$1" in
+        --group)   GROUP="${2:-}"; [ -n "$GROUP" ] || die "--group 缺少组名"; shift 2 ;;
         --flush)   FLUSH_SIG="${2:-}"; [ -n "$FLUSH_SIG" ] || die "--flush 缺少签名"; shift 2 ;;
         --timeout) TIMEOUT="${2:-}"; shift 2 ;;
         --note)    NOTE="${2:-}"; shift 2 ;;
         --once)    ONCE=1; shift ;;
-        *) die "未知选项: $1" ;;
+        --*)       die "未知选项: $1" ;;
+        *)         TARGET="$1"; shift ;;
       esac
     done
-    # 复用 send.sh 的目标解析(别名/标题/子串/重名拒绝),从 dry-run 输出取 ref/win/title
-    line=$(SEND_SELF_OK=1 "$S_DIR/send.sh" "$TARGET" --dry-run x 2>&1 | head -1) || die "✗ 目标解析失败: $line"
-    TGT_REF=$(printf '%s' "$line" | sed -n 's/^目标: \(surface:[0-9]*\) .*/\1/p')
-    TGT_WIN=$(printf '%s' "$line" | sed -n 's/.*(\(window:[0-9]*\),.*/\1/p')
-    TGT_TITLE=$(printf '%s' "$line" | sed -n 's/.*, \(.*\))$/\1/p')
-    [ -n "$TGT_REF" ] && [ -n "$TGT_WIN" ] || die "✗ 目标解析失败: $line"
+    if [ -n "$GROUP" ]; then
+      [ -z "$TARGET" ]    || die "idle: <目标> 与 --group 二选一"
+      [ -z "$FLUSH_SIG" ] || die "idle --group 不支持 --flush(补交是针对单目标卡箱消息的)"
+    else
+      [ -n "$TARGET" ] || die "用法: watch.sh idle <目标>|--group <组> [--flush '<签名>'] [--timeout 秒] [--note '...'] [--once]"
+    fi
+    # 后台重入时 TGT_LIST 已由环境带入,不重复解析
+    if [ -z "${TGT_LIST:-}" ]; then
+      if [ -n "$GROUP" ]; then
+        members=$(group_members "$GROUP") || die "✗ 找不到注册表——--group 依赖它确定组成员"
+        [ -n "$members" ] || die "✗ 组 '$GROUP' 里没有成员"
+        TGT_LIST=""
+        for m in $members; do
+          row=$(resolve_one "$m") || { echo "⚠️ 跳过 $m(离线或解析失败)" >&2; continue; }
+          [ "${row%%|*}" = "$SELF_REF" ] && continue   # 等自己空闲没有意义
+          TGT_LIST="$TGT_LIST$row
+"
+        done
+        [ -n "$TGT_LIST" ] || die "✗ 组 '$GROUP' 没有可看护的在线成员"
+        WATCH_DESC="组 $GROUP"
+      else
+        row=$(resolve_one "$TARGET") || die "✗ 目标解析失败: $TARGET"
+        TGT_LIST="$row"
+        WATCH_DESC="${row##*|}"
+      fi
+    fi
     if [ "$ONCE" = 1 ]; then
-      if busy_of "$TGT_REF" "$TGT_WIN"; then echo "判定: $TGT_TITLE($TGT_REF)忙"; else echo "判定: $TGT_TITLE($TGT_REF)闲"; fi
+      printf '%s\n' "$TGT_LIST" | while IFS='|' read -r ref win title; do
+        [ -n "$ref" ] || continue
+        if busy_of "$ref" "$win"; then echo "判定: $title($ref)忙"; else echo "判定: $title($ref)闲"; fi
+      done
       exit 0
     fi
     ;;
@@ -191,7 +257,11 @@ case "$CMD" in
     what="${1:-all}"; stopped=0
     shopt -s nullglob
     for p in "$WDIR/${SELF_REF//:/_}"-*.pid; do
-      case "$what" in all) : ;; *) [ "$p" = "$WDIR/${SELF_REF//:/_}-$what.pid" ] || continue ;; esac
+      # idle watcher 按(会话,目标)有多个,stop idle 按前缀停掉全部
+      case "$what" in
+        all) : ;;
+        *) case "$(basename "$p")" in "${SELF_REF//:/_}-$what"*.pid) : ;; *) continue ;; esac ;;
+      esac
       pid=$(cat "$p" 2>/dev/null) || true
       [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
       rm -f "$p"; stopped=$((stopped + 1))
@@ -204,6 +274,16 @@ case "$CMD" in
     ;;
 esac
 
+# ── 锁:idle 按(会话,目标/组)一个,同时盯多个目标互不挤占;overdue 每会话一个 ──
+case "$CMD" in
+  idle)
+    if [ -n "$GROUP" ]; then key="group-${GROUP//[^A-Za-z0-9_-]/_}"
+    else first_ref="${TGT_LIST%%|*}"; key="${first_ref//:/_}"; fi
+    LOCK="$WDIR/${SELF_REF//:/_}-idle-$key.pid"
+    ;;
+  overdue) LOCK="$WDIR/${SELF_REF//:/_}-overdue.pid" ;;
+esac
+
 # ── 后台化:WATCH_FG=1 是重入标志(后台副本直接跑主循环)────────────────────────
 mkdir -p "$WDIR"
 if [ "${WATCH_FG:-0}" = 1 ]; then
@@ -212,15 +292,15 @@ if [ "${WATCH_FG:-0}" = 1 ]; then
   exit 0
 fi
 if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK")" 2>/dev/null; then
-  die "✗ 本会话已有 $CMD watcher(pid $(cat "$LOCK"))在跑,先 watch.sh stop $CMD"
+  die "✗ 已有同目标的 $CMD watcher(pid $(cat "$LOCK"))在跑,先 watch.sh stop $CMD"
 fi
-LOG="$WDIR/${SELF_REF//:/_}-$CMD.log"
+LOG="${LOCK%.pid}.log"
 case "$CMD" in
   idle)    WATCH_FG=1 FLUSH_SIG="$FLUSH_SIG" TIMEOUT="$TIMEOUT" NOTE="$NOTE" \
-           TGT_REF="$TGT_REF" TGT_WIN="$TGT_WIN" TGT_TITLE="$TGT_TITLE" \
-           nohup "$0" idle "$TARGET" >>"$LOG" 2>&1 & ;;
+           GROUP="$GROUP" TARGET="$TARGET" TGT_LIST="$TGT_LIST" WATCH_DESC="$WATCH_DESC" \
+           nohup "$0" idle >>"$LOG" 2>&1 & ;;
   overdue) WATCH_FG=1 AGE_MIN="$AGE_MIN" TIMEOUT="$TIMEOUT" \
            nohup "$0" overdue >>"$LOG" 2>&1 & ;;
 esac
 echo $! > "$LOCK"
-echo "✓ $CMD watcher 已启动(pid $!,日志 $LOG)"
+echo "✓ $CMD watcher 已启动(pid $!,盯 ${WATCH_DESC:-台账},日志 $LOG)"
