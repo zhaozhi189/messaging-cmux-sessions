@@ -24,6 +24,7 @@
 # <目标> 可以是:注册表别名 | tab 标题(精确)| 标题子串(唯一时)| surface:N
 #
 # 选项:
+#   --retry       已有持久编号的安全重试，通常由 delivery-wait.py 调用
 #   --no-from     不自动添加 "(from <本会话>)" 来源前缀(以 / 开头的斜杠命令自动不加)
 #   --dry-run     只解析定位与最终消息,不真的发送
 #
@@ -127,7 +128,7 @@ fi
 TARGET="$1"; shift
 [ $# -ge 1 ] || die "缺少消息文本"
 
-ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""; PEEK=0; DURABLE=0; MESSAGE_ID=""
+ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""; PEEK=0; DURABLE=0; MESSAGE_ID=""; RETRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --flush)   FLUSH_SIG="${2:-}"; [ -n "$FLUSH_SIG" ] || die "--flush 缺少签名参数"; shift 2 ;;
@@ -135,6 +136,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift ;;
     --ask)     ASK=1; shift ;;
     --durable) DURABLE=1; shift ;;
+    --retry) RETRY=1; shift ;;
     --id) MESSAGE_ID="${2:-}"; [ -n "$MESSAGE_ID" ] || die "--id 缺少编号"; shift 2 ;;
     --peek)    PEEK=1; shift ;;
     --reply)   REPLY_CORR="${2:-}"; [ -n "$REPLY_CORR" ] || die "--reply 缺少关联号参数"; shift 2 ;;
@@ -143,6 +145,7 @@ while [ $# -gt 0 ]; do
 done
 [ "$DURABLE" = 1 ] && { [ "$ASK" = 0 ] && [ -z "$REPLY_CORR" ] && [ "$PEEK" = 0 ] && [ -z "$FLUSH_SIG" ]; } || { [ "$DURABLE" = 0 ] || die "--durable 不与 ask/reply/peek/flush 混用"; }
 [ -z "$MESSAGE_ID" ] || [ "$DURABLE" = 1 ] || die "--id 只用于 --durable"
+[ "$RETRY" = 0 ] || { [ "$DURABLE" = 1 ] && [ -n "$MESSAGE_ID" ]; } || die "--retry 仅用于已有持久消息编号"
 [ "$ASK" = 1 ] && [ -n "$REPLY_CORR" ] && die "--ask 与 --reply 不能同时使用"
 
 row=$(resolve "$TARGET")
@@ -218,10 +221,36 @@ if [ "$DRY" != 1 ]; then
   trap 'rm -f "$SEND_LOCK/pid"; rmdir "$SEND_LOCK" 2>/dev/null || true' EXIT
 fi
 
+# 投递监听仅在目标锁内复核原编号、endpoint、权限与完整输入，不清空用户草稿。
+if [ "$RETRY" = 1 ]; then
+  [ "$DRY" = 0 ] || die "--retry 不与 --dry-run 混用"
+  action=$(python3 "$SCRIPT_DIR/delivery-wait.py" --probe --id "$MESSAGE_ID" --target "$ref") || exit 6
+  case "$action" in
+    notified|received|completed) echo "已有通知或接收记录，停止重试"; exit 0 ;;
+    empty|owned)
+      python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "${CMUX_FROM:-codex-external}" "$MSG" "$MESSAGE_ID" >/dev/null || exit 6
+      ;;
+    session_changed) echo "目标身份已改变，停止旧路由" >&2; exit 6 ;;
+    *) echo "投递继续等待：$action"; exit 2 ;;
+  esac
+  if [ "$action" = owned ]; then
+    FLUSH_SIG="请查 cmux 收件箱：$MESSAGE_ID"
+  fi
+fi
+
 # ── --flush:补交卡在目标输入框里的消息 ────────────────────────────────────────
 if [ -n "$FLUSH_SIG" ]; then
   if msg_in_box "$FLUSH_SIG"; then
     is_busy "$(read_tail 40)" && { echo "⚠️ 目标忙，暂不补交"; exit 2; }
+    if [ "$RETRY" = 1 ]; then
+      action=$(python3 "$SCRIPT_DIR/delivery-wait.py" --probe --id "$MESSAGE_ID" --target "$ref") || exit 6
+      case "$action" in
+        notified|received|completed) exit 0 ;;
+        owned) : ;;
+        session_changed) exit 6 ;;
+        *) echo "补交前状态变化，继续等待：$action"; exit 2 ;;
+      esac
+    fi
     "$CMUX" send --window "$win" --surface "$ref" '\r' >/dev/null; sleep 2
     msg_in_box "$FLUSH_SIG" && { echo "⚠️ flush 后仍残留 $ref"; exit 3; }
     ok "✓ 已补交 → $ref ($tgt_title)"
@@ -409,6 +438,16 @@ if [ -n "$CORR" ]; then
   else
     echo "外部调用方无 cmux surface：请在 brief 中约定回复文件，不向空目标发消息。"
   fi
+fi
+
+if [ "$RETRY" = 1 ]; then
+  action=$(python3 "$SCRIPT_DIR/delivery-wait.py" --probe --id "$MESSAGE_ID" --target "$ref") || exit 6
+  case "$action" in
+    notified|received|completed) exit 0 ;;
+    empty) : ;;
+    session_changed) exit 6 ;;
+    *) echo "发送前状态变化，继续等待：$action"; exit 2 ;;
+  esac
 fi
 
 # ── 发送:一条消息 + 一个 CR。中间绝不能有 \n / \r,否则变成换行而非提交。────

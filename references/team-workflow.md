@@ -63,7 +63,25 @@ printf '%s\n' "$BACKEND_RC" > /private/tmp/team-task/backend-send-exit
 printf '%s\n' "$FRONTEND_RC" > /private/tmp/team-task/frontend-send-exit
 ```
 
-逐项读取日志及原编号的 `--status`，处理失败；每个成功派出的任务按下节挂独立监听，不能用一个 wait 或一个总状态代替。投递退出码 0 也不代表验收通过。
+逐项读取日志及原编号的 `--status`；2/3 立即按入口的忙时投递规则挂原编号的 delivery-wait.py，4 的锁冲突核实后沿原编号重试，不丢失败；每个成功派出的任务按下节挂独立监听，不能用一个 wait 或一个总状态代替。投递退出码 0 也不代表验收通过。
+
+下面示例在首次持久发送遇到 2/3 时立即进入前台投递等待。台账必须已有该编号，状态文件不能覆盖信箱记录。投递成功后再挂任务监听，投递到期与任务完成分别处理。
+
+```bash
+SEND_RC=0
+bash "$S/send.sh" "$TARGET" --durable --id "$MESSAGE_ID" \
+  '请阅读 /private/tmp/team-task/brief.md' || SEND_RC=$?
+case "$SEND_RC" in
+  0) : ;;
+  2|3)
+    python3 "$S/delivery-wait.py" --id "$MESSAGE_ID" \
+      --state /private/tmp/team-task/delivery-watch.json --interval 30 --timeout 1800
+    ;;
+  *) printf '投递失败，退出码 %s，请核查原编号与日志\n' "$SEND_RC" ;;
+esac
+```
+
+等待脚本重试时通过 send.sh 的 `--retry` 在目标发送锁内再次验证原记录、endpoint、权限和完整输入。该选项只允许与已有 `--durable --id` 使用；协调者通常直接调用等待脚本，它从信箱读取原 sender/body。`--source-label` 仅可首次指定可信展示标签，恢复时不得改变。原门铃补交成功后才记录 notified；陌生文本及无法辨认的折行内容不会被提交。到期退出 5，核实归属后用原参数 `--resume` 续挂；身份漂移退出 6，停止旧路由并组织核实。
 
 ## 2. 交付文件与持续监听
 
@@ -117,9 +135,15 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("notify
 bash "$S/send.sh" --status "$FIRST_EVENT_ID"
 ```
 
-事件 `delivered=true` 及信箱 `notified/received/completed` 证明通知已确认提交，仍不能证明接收方已验收任务。首次通知失败且尚未重试成功时不声称托管路由已经验证；保持前台跟进。协调会话收到门铃后必须读取自己的信箱与对应状态文件，按 task_id 恢复任务，不把门铃视作最终结论。普通 running、每轮检查及恢复 running 只写状态，不发通知。重要事件 completion_reported、blocked、approval_required、stalled、idle_unfinished、session_changed、timed_out、unknown、delivery_invalid 才通过 `send.sh --durable` 发短状态指针；对相同事件去重，失败保留队列并按原编号重试。相同状态文件持有互斥锁，避免重复监听。
+事件 `delivered=true` 及信箱 `notified/received/completed` 证明通知已确认提交，仍不能证明接收方已验收任务。首次通知失败且尚未重试成功时不声称托管路由已经验证；保持前台跟进。协调会话收到门铃后必须读取自己的信箱与对应状态文件，按 task_id 恢复任务，不把门铃视作最终结论。普通 running、每轮检查及恢复 running 只写状态，不发通知。重要事件 completion_reported、blocked、approval_required、stalled、idle_unfinished、session_changed、timed_out、unknown、delivery_invalid、blocked_cleared 才通过 `send.sh --durable` 发短状态指针；对相同事件去重，失败保留队列并按原编号重试。相同状态文件持有互斥锁，避免重复监听。
 
 新通知前缀显示“监听器 / 被监控对象”，来源标签与目标标签随事件落盘；项目主动消息继续使用 send.sh 的项目来源前缀，人工读 UI 即可区分。监听器通过 CMUX_FROM_LABEL 提供展示标签，CMUX_FROM 仍保存原发送身份；项目主动通知不设置该展示变量。来源标签只是展示，不赋予 ACK 身份。旧事件沿用原 sender 显示来源，包括 codex-external；不改原信箱编号、正文或 sender。普通事件含旧 pending running 标记 suppressed，delivered 仍为 false，不再重试也不拖住终止宽限。通知事件在落盘时固定 sender；重启后即使 `CMUX_FROM` 改变，同一事件仍沿用原 sender、编号和正文。旧事件缺少 sender 时从原信箱消息记录恢复，不改写已落盘消息的身份。
+
+旧告警失效要有明确依据：后续 stalled_cleared 可 supersede 之前未送达的 stalled；后续 blocked 内容变化、blocked_cleared 或 completion_reported 可取代之前未送达的 blocked。事件保留原 id/body/sender，写 suppressed=true、superseded=true、superseded_by及 suppressed_reason，delivered仍为false；原信箱文件不改写，输入框中的旧门铃不清空。已 delivered 的历史不修改；权限、身份变化、交付与到期通知不因普通恢复被抑制。尚未恢复的新一轮 stalled 仍保留。
+
+明确 blocked 时继续每30秒观察，同一阻塞不额外触发 stalled。仅updated_at变化视为心跳，不增加 blocked 通知；实质内容变化产生新 blocked 提醒；有效结构化结果由blocked转running产生一次 blocked_cleared 提醒，完成仍走completion_reported独立验收。旧状态没有 blocked_signature 时以已有summary/artifacts比较并建立基线，同内容不重复告警。
+
+迁移由监听所有者核实PID和完整命令后停旧进程；原task_id/target/notify/since/result/state不变，用新代码沿原参数启动。原状态兼容，无需删除事件或重建消息。活动状态首轮重新观察后迁移已明确blocked造成的旧stalled，已有恢复事件也会在读入和通知前抑制旧告警；终止状态只重试仍有效的通知，不重启目标观察。核对新PID、首轮status、告警抑制依据、日志及路由。已过观察期限须按原续挂规则核实并采用新的观察状态，不能用迁移绕过终止状态；保留旧通知对账记录。
 
 没有真实协调接收会话时省略 `--notify`，前台分段运行并读取状态，单次等待不超过 60 秒；不要在回合结束后声称会自动回来。报告完成、身份变化和到期时停止目标观察，仍按固定通知身份重试待发送事件，默认宽限 `--notify-grace 300` 秒；宽限期结束仍未送达时落盘 `delivery_error` 并以 5 退出。无通知路由时仅落盘。此限制必须如实报告，可沿用原参数 `--once` 对账重试，不能声称一定送达。通知接收会话处于忙碌、权限等待或未知状态时保留事件，不向其输入文字，后续沿用原编号重试。通知只是门铃：协调者醒来读状态文件、进度文件和看板，决定下一步。监听脚本不会自主批准、验收或扩大范围。
 

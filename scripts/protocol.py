@@ -107,9 +107,9 @@ def transition(message_id, state, actor):
         atomic(path, data)
 
 
-def busy(ref, state=None):
+def busy(ref, state=None, current_endpoint=None):
     path = ROOT / 'busy-v2' / (ref.replace(':', '_') + '.json')
-    key = endpoint(ref)
+    key = current_endpoint or endpoint(ref)
     if state is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with (path.parent / '.lock').open('a') as lock:

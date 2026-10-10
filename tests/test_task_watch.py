@@ -40,13 +40,20 @@ elif command == 'read-screen':
  if c.get('screen_fail'): sys.exit(1)
  print('─' * 160)
  if args[args.index('--surface') + 1] == 'surface:1':
-  print(c.get('receiver_screen', '› ' if (p / 'sent').exists() else '› Ask Codex to do anything'))
+  if (p / 'pending-notice').exists():
+   print(('• Working (1m • esc to interrupt)\\n' if c.get('send_pending') else '') + '› ' + (p / 'pending-notice').read_text())
+  else: print(c.get('receiver_screen', '› ' if (p / 'sent').exists() else '› Ask Codex to do anything'))
  else: print(c['screen'])
 elif command == 'send':
  count = int((p / 'send-count').read_text()) + 1 if (p / 'send-count').exists() else 1
  (p / 'send-count').write_text(str(count))
  if c.get('send_fail') or count <= c.get('send_fail_count', 0): sys.exit(1)
- (p / 'sent').touch()
+ if c.get('send_pending'):
+  value = args[-1]
+  (p / 'pending-notice').write_text(value[:-2] if value.endswith(r'\\r') else value)
+ else:
+  if (p / 'pending-notice').exists(): (p / 'pending-notice').unlink()
+  (p / 'sent').touch()
 ''')
         self.mock.chmod(0o755)
         self.env = dict(os.environ, CMUX_BIN=str(self.mock), MOCK_DIR=str(self.directory),
@@ -219,6 +226,19 @@ elif command == 'send':
         self.assertNotIn('delivery_error', state)
         self.assertFalse(any(call[0] == 'send' for call in self.calls()))
 
+    def test_pending_notice_is_flushed_with_original_id_after_receiver_idle(self):
+        self.options.update(screen='Do you want to proceed?\n1. Yes\n2. No', send_pending=True)
+        first = self.run_tick('--notify', 'surface:1')
+        identifier = first['events'][0]['id']
+        self.assertFalse(first['events'][0]['delivered'])
+        self.options['send_pending'] = False
+        state = self.run_tick('--notify', 'surface:1')
+        self.assertTrue(state['events'][0]['delivered'])
+        self.assertEqual(state['events'][0]['id'], identifier)
+        texts = [call[-1] for call in self.calls() if call[0] == 'send']
+        self.assertEqual(len(texts), 2)
+        self.assertEqual(texts[-1], '\\r')
+
     def test_session_generation_change_stops_monitor(self):
         self.run_tick()
         self.options['generation'] = 'gen2'
@@ -319,6 +339,99 @@ elif command == 'send':
         state = self.run_tick('--stale-after', '30')
         self.assertFalse(state['stalled'])
         self.assertIn('stalled_cleared', [event['type'] for event in state['events']])
+
+    def test_recovered_stalled_notice_is_superseded_without_record_rewrite(self):
+        self.options.update(screen='Working (esc to interrupt)\n› ', send_fail=True)
+        self.progress(); self.run_tick('--notify', 'surface:1')
+        state = json.loads(self.state.read_text()); state['last_progress_at'] = time.time() - 100
+        self.state.write_text(json.dumps(state))
+        state = self.run_tick('--notify', 'surface:1', '--stale-after', '30')
+        old = next(event for event in state['events'] if event['type'] == 'stalled')
+        record = self.directory / 'messages/messages' / (old['id'] + '.json')
+        original = record.read_bytes()
+        self.options.update(receiver_screen='Working (esc to interrupt)\n› ', send_fail=False)
+        self.progress(summary='已恢复工作')
+        state = self.run_tick('--notify', 'surface:1', '--stale-after', '30')
+        event = next(event for event in state['events'] if event['id'] == old['id'])
+        self.assertTrue(event['suppressed']); self.assertTrue(event['superseded'])
+        self.assertFalse(event['delivered']); self.assertIn('stalled_cleared', event['suppressed_reason'])
+        self.assertEqual(record.read_bytes(), original)
+        for field in ('id', 'sender', 'body'):
+            self.assertEqual(event[field], old[field])
+
+    def test_legacy_queue_keeps_current_stall_and_critical_notices(self):
+        self.options.update(screen='Working (esc to interrupt)\n› ', receiver_screen='Working (esc to interrupt)\n› ')
+        state = self.run_tick('--notify', 'surface:1')
+        def event(identifier, kind):
+            return dict(id=identifier, type=kind, created_at=time.time(), delivered=False, attempts=0,
+                        sender='original', body='原正文')
+        state['events'] = [event('mold', 'stalled'), event('mclear', 'stalled_cleared'),
+                           event('mcurrent', 'stalled'), event('mpermission', 'approval_required'),
+                           event('midentity', 'session_changed'), event('mdone', 'completion_reported'),
+                           event('mtimeout', 'timed_out')]
+        state.update(last_progress_at=time.time() - 100, stalled=True)
+        self.state.write_text(json.dumps(state))
+        state = self.run_tick('--notify', 'surface:1', '--stale-after', '30')
+        self.assertTrue(state['events'][0]['superseded'])
+        for event in state['events'][2:]:
+            self.assertFalse(event.get('suppressed', False))
+            self.assertFalse(event['delivered'])
+        self.assertFalse(any(call[0] == 'send' for call in self.calls()))
+
+    def test_unchanged_blocked_has_no_extra_stalled_and_changes_are_alerted(self):
+        self.options.update(screen='Working (esc to interrupt)\n› ', receiver_screen='Working (esc to interrupt)\n› ')
+        self.progress(status='blocked', summary='等待后端验收')
+        self.run_tick('--notify', 'surface:1')
+        state = json.loads(self.state.read_text()); state['last_progress_at'] = time.time() - 100
+        self.state.write_text(json.dumps(state))
+        state = self.run_tick('--notify', 'surface:1', '--stale-after', '30')
+        self.assertFalse(state['stalled'])
+        self.assertEqual([event['type'] for event in state['events']], ['blocked'])
+        self.progress(status='blocked', summary='等待后端验收')
+        state = self.run_tick('--notify', 'surface:1')
+        self.assertEqual(len(state['events']), 1)
+        self.progress(status='blocked', summary='缺少新的字段契约')
+        state = self.run_tick('--notify', 'surface:1')
+        self.assertEqual([event['type'] for event in state['events']], ['blocked', 'blocked'])
+        self.assertTrue(state['events'][0]['superseded'])
+        self.assertFalse(state['events'][1].get('suppressed', False))
+        self.progress(summary='依赖已满足，继续实现')
+        state = self.run_tick('--notify', 'surface:1')
+        self.assertEqual(state['events'][-1]['type'], 'blocked_cleared')
+        self.assertFalse(state['events'][-1]['suppressed'])
+        self.assertTrue(state['events'][1]['superseded'])
+        self.assertFalse(any(call[0] == 'send' for call in self.calls()))
+
+    def test_legacy_blocked_stall_migrates_without_duplicate_blocked_notice(self):
+        self.options.update(screen='Working (esc to interrupt)\n› ', receiver_screen='Working (esc to interrupt)\n› ')
+        self.progress(status='blocked', summary='等待后端验收')
+        state = self.run_tick('--notify', 'surface:1')
+        state.pop('blocked_signature', None); state.pop('blocked_active', None)
+        state.update(stalled=True, last_progress_at=time.time() - 100)
+        state['events'].append(dict(id='mlegacy', type='stalled', delivered=False, attempts=0,
+                                    created_at=time.time(), sender='original', body='原告警正文'))
+        self.state.write_text(json.dumps(state))
+        state = self.run_tick('--notify', 'surface:1', '--stale-after', '30')
+        self.assertFalse(state['stalled'])
+        self.assertEqual(sum(event['type'] == 'blocked' for event in state['events']), 1)
+        old = next(event for event in state['events'] if event['id'] == 'mlegacy')
+        self.assertTrue(old['superseded']); self.assertFalse(old['delivered'])
+        self.assertFalse(any(call[0] == 'send' for call in self.calls()))
+
+    def test_superseded_stall_does_not_hold_terminal_or_clear_typed_notice(self):
+        state = self.run_tick('--notify', 'surface:1')
+        self.options['receiver_screen'] = '› (from original) 请查 cmux 收件箱：mold'
+        state.update(status='completion_reported', stopped=True, terminal_at=time.time() - 100)
+        state['events'] = [dict(id='mold', type='stalled', created_at=time.time() - 30,
+                                sender='original', body='原正文', attempts=1, delivered=False),
+                           dict(id='mclear', type='stalled_cleared', created_at=time.time() - 20,
+                                sender='original', body='恢复记录', attempts=0, delivered=False)]
+        self.state.write_text(json.dumps(state))
+        state = self.run_tick('--notify', 'surface:1', '--notify-grace', '.1', once=False)
+        self.assertTrue(state['events'][0]['superseded'])
+        self.assertFalse(state['events'][0]['delivered'])
+        self.assertNotIn('delivery_error', state)
+        self.assertFalse(any(call[0] == 'send' for call in self.calls()))
 
     def test_timeout_stops_without_completion_and_once_never_sleeps(self):
         self.run_tick()

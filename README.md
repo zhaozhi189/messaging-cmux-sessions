@@ -173,6 +173,7 @@ messaging-cmux-sessions/
 │   ├── watch.sh                    # 零 token 看护:等空闲 / 盯账龄,条件满足注入唤醒
 │   ├── busy-hook.sh                # 生命周期回调:写语义化忙/闲状态
 │   ├── protocol.py                 # 结构化发现、持久信箱与会话身份校验
+│   ├── delivery-wait.py            # 原编号投递等待：忙/草稿只观察，精确门铃补交
 │   └── task-watch.py               # 当次任务监听与持久事件通知
 └── tests/
     ├── test_send.py                # 模拟 cmux 的发送与协议回归测试
@@ -285,7 +286,9 @@ bash "$S/send.sh" --status m原消息编号
 
 ## 团队协作闭环
 
-有交付的派单默认附 task_id、仓库负责人、依赖、契约职责、产物和进度文件，并启动 `task-watch.py`。默认每 30 秒观察，5 分钟无进展提醒，2 小时监听到期；后台运行需核实 PID、首次状态及真实唤醒目标。外部 caller=null 可显式 `--notify surface:N`，不冒充来源身份。
+持久发送返回 2/3 时立即用 `delivery-wait.py --id <原编号> --state <绝对路径>` 继续等待，不能只报告后结束。它绑定原 endpoint/sender/body，权限与陌生输入只观察；到期未送达用 `--resume` 核实续挂，身份漂移停止旧路由。前台单次等待最多 60 秒，后台必须核实 PID、首轮状态和真实协调接收方。
+
+有交付的派单默认附 task_id、仓库负责人、依赖、契约职责、产物和进度文件，并启动 `task-watch.py`。默认每 30 秒观察，5 分钟无进展提醒，2 小时监听到期；后台运行需核实 PID、首次状态及真实唤醒目标。已明确 blocked 时不额外制造 stalled；阻塞内容变化/解除会提醒，已恢复未送达告警保留历史并标为 superseded，抑制不等于送达。外部 caller=null 可显式 `--notify surface:N`，不冒充来源身份。
 
 监听区分权限等待、未交付的空闲、未知状态、会话身份变化和当次交付。通知只在状态变化时发送，失败沿用同消息编号重试。`completion_reported` 表示等待验收；协调者检查实际文件、diff 与跨项目契约后才标记 `accepted`。到期需要续挂或处理，不能当作任务完成。
 

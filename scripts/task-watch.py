@@ -117,7 +117,11 @@ def screen_state(row):
                                capture_output=True, text=True, timeout=10)
     if completed.returncode:
         return 'unknown'
-    screen = '\n'.join(completed.stdout.splitlines()[-30:])
+    return classify_screen(completed.stdout)
+
+
+def classify_screen(output):
+    screen = '\n'.join(output.splitlines()[-30:])
     finished = list(re.finditer(r'^\s*(?:[•✶✻✽]\s+)?(?:Worked|Brewed|Cogitated)\s+for\b',
                                 screen, re.MULTILINE | re.IGNORECASE))
     if finished:
@@ -153,13 +157,29 @@ def delivery_valid(result):
 
 
 IMPORTANT_EVENTS = ('approval_required', 'blocked', 'session_changed', 'timed_out',
-                    'completion_reported', 'stalled', 'idle_unfinished', 'unknown', 'delivery_invalid')
+                    'completion_reported', 'stalled', 'idle_unfinished', 'unknown', 'delivery_invalid', 'blocked_cleared')
 
 
 def suppress_quiet_events(state):
     for event in state['events']:
         if not event['delivered'] and event['type'] not in IMPORTANT_EVENTS:
             event['suppressed'] = True
+            event.setdefault('suppressed_reason', '普通进度静默，不代表送达')
+    supersede_resolved_events(state)
+
+
+def supersede_resolved_events(state):
+    events = state['events']
+    for kind, resolutions in (('stalled', ('stalled_cleared',)),
+                              ('blocked', ('blocked', 'blocked_cleared', 'completion_reported'))):
+        resolved = [(index, event) for index, event in enumerate(events) if event['type'] in resolutions]
+        if not resolved:
+            continue
+        cutoff, evidence = resolved[-1]
+        for event in events[:cutoff]:
+            if event['type'] == kind and not event['delivered'] and not event.get('superseded'):
+                event.update(suppressed=True, superseded=True, superseded_by=evidence['id'],
+                             suppressed_reason=kind + ' 已被后续 ' + evidence['type'] + ' 取代；历史和信箱身份保留')
 
 
 def pending_events(state):
@@ -220,8 +240,11 @@ def notify_once(args, state, rows):
     env = dict(os.environ, SEND_SELF_OK='1', CMUX_FROM=pending['sender'],
                CMUX_FROM_LABEL=pending.get('source_label') or pending['sender'])
     try:
-        completed = subprocess.run(['bash', str(Path(__file__).with_name('send.sh')), args.notify,
-                                    '--durable', '--id', pending['id'], pending['body']],
+        command = ['bash', str(Path(__file__).with_name('send.sh')), args.notify,
+                   '--durable', '--id', pending['id']]
+        if protocol.message_path(pending['id']).exists():
+            command.append('--retry')
+        completed = subprocess.run(command + [pending['body']],
                                    env=env, capture_output=True, text=True, timeout=20)
         pending['delivered'] = completed.returncode == 0
         state['notify_error'] = '' if pending['delivered'] else '通知未确认送达，事件保留并在下一轮重试'
@@ -237,6 +260,11 @@ def tick(args, state):
     result = None
     previous = state['status']
     previous_stalled = state['stalled']
+    previous_blocked = state.get('blocked_active', previous == 'blocked')
+    previous_blocked_signature = state.get('blocked_signature')
+    previous_blocked_content = (state.get('summary', ''), state.get('artifacts', []))
+    blocked_changed = False
+    blocked_cleared = False
     state.update(checked_at=now, stopped=False)
     try:
         rows = discover()
@@ -265,6 +293,16 @@ def tick(args, state):
                 state.update(last_progress_at=now, progress_signature=signature)
             state.update(result_updated_at=result['updated_at'], summary=result.get('summary', ''),
                          artifacts=result.get('artifacts', []))
+        if result is not None:
+            if result['status'] == 'blocked':
+                content = {key: value for key, value in result.items() if key != 'updated_at'}
+                signature = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                blocked_changed = (signature != previous_blocked_signature if previous_blocked_signature else
+                                   previous_blocked_content != (result.get('summary', ''), result.get('artifacts', [])))
+                state.update(blocked_active=True, blocked_signature=signature)
+            else:
+                blocked_cleared = previous_blocked and result['status'] == 'running'
+                state['blocked_active'] = False
         observed = screen_state(row)
         state['screen_state'] = observed
         state['idle_streak'] = state['idle_streak'] + 1 if observed == 'idle' else 0
@@ -287,14 +325,16 @@ def tick(args, state):
     if now - state['started_at'] >= args.timeout and status != 'session_changed':
         status, reason = 'timed_out', '监听到期；任务尚未由协调者验收'
         state['stopped'] = True
-    state['stalled'] = now - state['last_progress_at'] >= args.stale_after and status not in ('completion_reported', 'session_changed', 'timed_out')
+    state['stalled'] = now - state['last_progress_at'] >= args.stale_after and status not in ('completion_reported', 'session_changed', 'timed_out', 'blocked')
     state.update(status=status, reason=reason)
     if status == 'completion_reported':
         state['stopped'] = True
     if state['stopped']:
         state.setdefault('terminal_at', now)
-    if status != previous:
+    if status != previous or (status == 'blocked' and blocked_changed):
         add_event(state, status, args, now)
+    if blocked_cleared:
+        add_event(state, 'blocked_cleared', args, now)
     if state['stalled'] and not previous_stalled:
         add_event(state, 'stalled', args, now)
     elif previous_stalled and not state['stalled']:
