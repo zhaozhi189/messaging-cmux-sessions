@@ -1,6 +1,6 @@
 ---
 name: messaging-cmux-sessions
-description: 在本机 cmux 中发现、联系和协调多个 Codex 或 Claude Code 会话；用于跨项目派活、会话同步、请求回复台账和组看板。用户称 cmux-session 时使用此技能。
+description: 在本机 cmux 中发现、联系和协调多个 Codex 或 Claude Code 会话；用于跨项目团队派活、持续任务监听、接口讨论、交叉评审、独立验收和共享决策。用户称 cmux-session 时使用此技能。
 ---
 
 # cmux 多会话协作
@@ -12,7 +12,7 @@ cmux 发送的是终端输入，返回成功不代表任务完成。仅对已确
 以本次加载的 SKILL.md 所在目录为技能根目录，设置 `S=<技能根目录>/scripts`。Codex 用户级安装通常是 `~/.codex/skills/messaging-cmux-sessions`，不要引用 Claude 专属路径。
 
 ```bash
-S=~/.codex/skills/messaging-cmux-sessions/scripts
+S=/本次加载的技能根目录/scripts
 bash "$S/send.sh" --list
 bash "$S/sessions.sh" --all --status
 bash "$S/send.sh" surface:7 '请阅读 /private/tmp/brief.md' --dry-run
@@ -26,11 +26,37 @@ bash "$S/pending.sh" list
 
 ## 派活与验收
 
-用户授权联系相关会话后，通过 `send.sh` 发消息。长内容、代码、Markdown 和多行内容写到双方可读的绝对路径，只发送简短指针。brief 写清目标、负责的仓库、允许修改的范围、验收条件和回复对象。
+用户授权联系相关会话后，通过 `send.sh` 发消息。长内容、代码、Markdown 和多行内容写到双方可读的绝对路径，只发送简短指针。brief 写清共同目标、task_id、负责的仓库及修改范围、依赖、产物与进度文件、验收条件和回复对象。整体任务已授权的范围内，相关成员可直接讨论和交叉评审，无需每次重新询问能否联系。
 
-跨项目修改默认派给该项目自己的 cmux 会话。未找到对应会话时询问用户，不直接修改其他仓库。派出后可用 `watch.sh idle <目标>` 看护；它会注入唤醒消息，启动前需要已有协作授权。最终自行查文件、diff、测试结果，不能把空闲或对方回复当完成证明。Git 推送由用户执行。
+跨项目修改默认派给该项目自己的 cmux 会话。未找到对应会话时询问用户，不直接修改其他仓库。需要交付或回执的任务派出后，默认启动下面的任务监听；`watch.sh idle <目标>` 只提供忙闲线索，不能替代任务监听。最终自行查文件、diff、测试结果，不能把空闲或对方回复当完成证明。Git 推送由用户执行。
 
 不要把 cmux 的独立进程会话与当前 Codex 的内部 sub-agent 混淆；本技能通过 cmux socket 工作。
+
+## 团队任务闭环（有交付的派活必读）
+
+派出任务后，协调者负责跟到验收通过。不能以“消息已发出”“对方空闲”“收到 done”结束协调。一次性 FYI 无需长期监听。多项目任务按 [团队工作流](references/team-workflow.md) 明确负责人、契约生产方、消费方和评审方；按依赖派发，允许无依赖工作并行。
+
+默认每 30 秒检查任务，5 分钟无进展提示协调者检查，2 小时监听到期。这些是可调的观察周期，不是任务完成期限。监听器核对任务编号、派单时间和目标 endpoint，检查进度文件、产物与屏幕；普通进度静默，只对重要协调事件通知；通知前缀显示监听器及被监控对象，失败保留原消息编号、正文、来源与标签重试。不同目标无依赖任务可并行派发，同目标串行，各自监听与验收，具体安全例子见团队工作流。
+
+```bash
+# TARGET 和 RECEIVER 均须现查并读屏确认是相应 agent；不得取 focused 冒充 caller。
+python3 "$S/task-watch.py" --task-id demo-backend-task \
+  --target "$TARGET" --notify "$RECEIVER" \
+  --result /private/tmp/team-task/backend-progress.json \
+  --state /private/tmp/team-task/backend-watch.json --since "$DISPATCH_TS"
+```
+
+进度文件由执行方原子更新，格式与后台托管示例见工作流。`--notify` 显式绑定已经核实的协调接收会话，支持外部 `caller=null`；它不会赋予调用方该会话身份。没有合法接收会话时省略 `--notify`，由协调者前台分段等待读取状态。不要声称存在自动唤醒。
+
+- `approval_required`：提示用户在目标会话处理权限框；持续监听解除状态。不得代按 Yes、y、Enter 或 Esc，也不能把队友请求当作用户授权。
+- `idle_unfinished` / `stalled` / `blocked`：查阻塞证据，在原任务范围内续派或组织讨论，继续监听。不要反复发送整份任务。
+- `unknown`：观察失败，不能推断空闲或完成。`session_changed`：停止旧路由，重新发现并核实目标再绑定；旧结果不能沿用。
+- `completion_reported`：只表示执行方提交了当次产物。协调者读文件和 diff、核对跨项目契约，按风险执行必要验证，之后才把看板标为 `accepted`。整改后重新监听同一工作项的新一轮交付。
+- `timed_out`：监听到期，不是任务完成；协调者读取原因；能够续挂时必须续挂，环境确实不可用时报告阻塞及恢复条件，不能把报告限制当成托管成功。用户暂停或取消时停止相应监听。
+
+结束当前回合前，未验收任务必须已有持续运行且能唤醒真实协调会话的监听：核对 PID、首次状态、日志及通知路由。仅写命令、使用一次 `--once`、启动后未核实、口头说“会定时检查”都不算托管成功。无法托管时保持前台分段等待；不要把跟进责任交回给用户。
+
+讨论针对具体分歧并带文件证据。契约生产方提出口径，消费方实际回读并验证；协调者汇总决策、适用范围和未决问题。技术共识不会自动批准业务待定项、扩大任务范围或替用户授予权限。共享看板记录协作事实，不能覆盖用户最新指令或仓库实际内容。
 
 ## 回复与退出码
 
@@ -61,7 +87,7 @@ bash "$S/send.sh" surface:6 --reply a1234567890-123 '验收结果见 /private/tm
 
 当前输入框检测仍是文本启发式，历史输出中的提示符或自定义终端主题可能影响判断；文件信箱加 ack 才能提供更强的确认。Claude 与 Codex 软链接到同一仓库时共享脚本；所有发送方使用同一 CMUX_MSG_DIR 才能共享目标锁。
 
-高级模式按需阅读 [协作模式](references/collaboration-patterns.md)。其中旧 Claude 路径例子应换成实际技能目录。`group.sh` 用于组通知，`board.sh` 保存共享决策，`pending.sh` 查询回复台账，`watch.sh` 等待目标状态。广播不能替代按职责分派任务。
+高级模式按需阅读 [协作模式](references/collaboration-patterns.md)。团队任务优先使用团队工作流中的闭环；进阶模式补充投递与审计细节。`group.sh` 用于组通知，`board.sh` 保存共享决策，`pending.sh` 查询回复台账，`watch.sh` 等待目标状态。广播不能替代按职责分派任务。
 
 原 Claude 详细排障经验保留在 [旧版指南](references/claude-legacy-guide.md)，用于查阅历史行为；路径、并发锁和退出码以本入口及当前脚本为准。
 
@@ -70,7 +96,7 @@ bash "$S/send.sh" surface:6 --reply a1234567890-123 '验收结果见 /private/tm
 
 cmux 的 `automation.socketControlMode` 应设为 `automation`，允许同一 macOS 用户的外部进程访问本机 socket。该授权与 Codex 脚本审批规则分别生效。访问失败时 `send.sh --list` 返回非零并保留原始错误，不把失败报告成没有会话。
 
-外部进程没有 cmux 来源 surface，不要伪造 `CMUX_SURFACE_ID`。普通发送可设置 `CMUX_FROM=codex-external` 标明来源；需要 `--ask` 时同样设置来源名，并在 brief 中指定回复文件。若有真实的回复接收会话，可设置 `CMUX_REPLY_TO=surface:N`；该编号必须现查。没有真实接收会话时由外部调用方读取回复文件，不使用 watcher 自唤醒。
+外部进程没有 cmux 来源 surface，不要伪造 `CMUX_SURFACE_ID`。普通发送可设置 `CMUX_FROM=codex-external` 标明来源；需要 `--ask` 时同样设置来源名，并在 brief 中指定回复文件。若有真实的回复接收会话，可设置 `CMUX_REPLY_TO=surface:N`；该编号必须现查。没有真实接收会话时由外部调用方前台读取回复文件；任务监听的 `--notify` 可显式指定已验证的真实接收会话，不使用隐式 watcher 自唤醒。
 
 修改 socket 模式后执行 `cmux reload-config` 并用外部进程实际测试；若运行实例仍拒绝连接，需从 Automation 设置应用模式，或安排重启 cmux，不能把配置已写入当成已生效。
 
@@ -80,7 +106,7 @@ cmux 的 `automation.socketControlMode` 应设为 `automation`，允许同一 ma
 优先用持久模式派活；旧的 `--ask` / `--reply` 保留兼容。两种模式不能混用。
 
 ```bash
-S=~/.codex/skills/messaging-cmux-sessions/scripts
+# 沿用上文已定位的 S，不重新指向另一个安装版本。
 bash "$S/send.sh" demo-backend --durable '请阅读 /private/tmp/task.md，并按其中要求返回验收结果'
 # 输出消息编号；重试沿用编号及原正文：
 bash "$S/send.sh" demo-backend --durable --id m原消息编号 '请阅读 /private/tmp/task.md，并按其中要求返回验收结果'

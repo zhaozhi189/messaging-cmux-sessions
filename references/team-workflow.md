@@ -1,0 +1,148 @@
+# 团队任务工作流
+
+多项目会话共同负责一个结果。协调者维护目标、依赖与验收；项目负责人只修改自己的仓库；契约生产方负责字段及行为口径；消费方和评审方拿实际文件验证。一个会话可以承担多个职责，不必为每项工作新增 agent。
+
+## 1. 派单前建立共同上下文
+
+现查会话和仓库，读屏确认目标是 agent。命令中的 window/surface 必须使用当前发现结果：
+
+```bash
+bash "$S/send.sh" --list
+cmux read-screen --window "$TARGET_WINDOW" --surface "$TARGET" --scrollback --lines 80
+```
+
+没有目标项目会话时按入口规则询问用户，不把普通 shell 当 agent。用 `board.sh <组> --init` 建共享看板，已有看板直接读取。只发送需要处理的成员，更新看板例如：
+
+```bash
+bash "$S/board.sh" "$GROUP" --set-status "$TARGET" "$TASK_ID" running
+bash "$S/board.sh" "$GROUP" --ask '具体契约分歧及证据路径' --owner "$CONTRACT_OWNER"
+bash "$S/board.sh" "$GROUP" --decide "$DECISION_ID" '已讨论的技术口径' '证据版本、理由和适用范围'
+```
+
+任务 brief 放共享绝对路径，使用以下骨架：
+
+```text
+共同目标：最终用户需要什么结果。
+task_id：本轮唯一编号；消息编号由 send.sh 管理，二者不同。
+负责人：目标会话、仓库、允许修改的文件或模块；不覆盖他人改动。
+依赖：先决产物；无依赖部分可继续；依赖验收后再推进消费方。
+契约职责：谁提供口径，谁回读，谁记录技术建议，哪些需用户决定。
+基线：当下 HEAD、已有改动、参考需求和原型的绝对路径。
+交付：产物绝对路径、验证结果、未决项、变更版本或提交哈希。
+进度：progress.json 路径、目标 endpoint、派单时间戳、状态更新约定。
+验收：具体行为与边界、必须对齐的接口、风险相称的检查。
+回复：结果文件和真实协调接收会话；外部 caller=null 不伪造身份。
+执行约定：范围内连续推进；阻塞马上写明原因、需要谁处理。
+```
+
+共享看板状态建议使用 `running → completion_reported → reviewing → accepted`，有阻塞记 `blocked` 和责任人。这些是任务状态，不替换持久信箱的 `recorded/notified/received/completed` 传输状态。ACK 只表示接收，`--complete` 只表示自报完成，验收由协调者负责。
+
+目标 busy 或停在权限框时，先把 brief 和待通知项落盘，等安全可接收时才发送门铃；当前 send.sh 没有文档化的仅入队不通知模式，不要为了入队向权限框发送文字。用持久模式发送短指针，保存返回的消息编号；失败重试同编号及原正文。外部调用方接收确认受真实 caller 限制时，明确改用进度与结果文件，不调用别人身份下的 `--ack/--complete`。
+
+### 独立目标并行派单
+
+不同目标且没有依赖的工作可以同时发送；同一目标串行，有依赖时先验收前置产物。各目标各自保存消息编号、退出码、结果文件与监听状态，并逐个独立验收。锁冲突保留原编号重试，不能丢弃失败或无差别广播。并行只是派单方式，团队仍须围绕共同目标讨论证据、互相回读契约并总结可复用的结论。
+
+下面两个目标必须已经现查、读屏确认可安全输入，brief 已写好。先生成各自编号，发送失败仍保留编号与原正文；不要使用 busy Tab 入队或向权限框输入：
+
+```bash
+BACKEND_ID="m$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+FRONTEND_ID="m$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+printf '%s\n' "$BACKEND_ID" > /private/tmp/team-task/backend-message-id
+printf '%s\n' "$FRONTEND_ID" > /private/tmp/team-task/frontend-message-id
+bash "$S/send.sh" "$BACKEND_TARGET" --durable --id "$BACKEND_ID" \
+  '请阅读 /private/tmp/team-task/backend-brief.md' > /private/tmp/team-task/backend-send.log 2>&1 &
+BACKEND_PID=$!
+bash "$S/send.sh" "$FRONTEND_TARGET" --durable --id "$FRONTEND_ID" \
+  '请阅读 /private/tmp/team-task/frontend-brief.md' > /private/tmp/team-task/frontend-send.log 2>&1 &
+FRONTEND_PID=$!
+# 即使调用方启用 set -e，也收集两个退出码。
+if wait "$BACKEND_PID"; then BACKEND_RC=0; else BACKEND_RC=$?; fi
+if wait "$FRONTEND_PID"; then FRONTEND_RC=0; else FRONTEND_RC=$?; fi
+printf '%s\n' "$BACKEND_RC" > /private/tmp/team-task/backend-send-exit
+printf '%s\n' "$FRONTEND_RC" > /private/tmp/team-task/frontend-send-exit
+```
+
+逐项读取日志及原编号的 `--status`，处理失败；每个成功派出的任务按下节挂独立监听，不能用一个 wait 或一个总状态代替。投递退出码 0 也不代表验收通过。
+
+## 2. 交付文件与持续监听
+
+`S` 是本次加载的技能根目录下的 scripts。派单前核实两个真实 surface，取得目标 endpoint 和 Unix 派单时间，写入 brief。endpoint 格式是 `workspace UUID|tty|surface`，可从现查的 `cmux --json tree --all` 取得，或调用已有 Python 函数：
+
+```bash
+TARGET_ENDPOINT=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import protocol; print(protocol.endpoint(sys.argv[2]))' "$S" "$TARGET")
+DISPATCH_TS=$(date +%s)
+```
+
+把取得值写入 brief。不要从旧标题猜编号。
+
+执行方写进度时先写同目录临时文件，再用原子替换。状态契约：
+
+```json
+{
+  "task_id": "demo-backend-task",
+  "target_endpoint": "当前 workspace UUID|当前 tty|surface:N",
+  "status": "running",
+  "updated_at": 1791600000,
+  "artifacts": [],
+  "summary": "正在核对接口约束"
+}
+```
+
+`updated_at` 是 Unix 秒；`status` 仅为 `running/blocked/completed`。在接收、实质进展、阻塞和交付时更新。`completed` 必须附存在的绝对路径产物；仅提交号、屏幕文字、文件 mtime 或 HEAD 移动不足以证明任务完成。`blocked` 写明需要谁处理及原因。业务未决项保留在产物里，不伪装已经批准。
+
+需要交付的每个子任务默认一个监听。以下变量均来自本轮已核实的 brief；路径避免复用昨天任务的文件：
+
+```bash
+# 先前台单次观察，检查参数、endpoint 和状态输出。
+python3 "$S/task-watch.py" --task-id "$TASK_ID" --target "$TARGET" \
+  --notify "$RECEIVER" --since "$DISPATCH_TS" \
+  --result "$RESULT_FILE" --state "$WATCH_STATE" --once
+
+# 先读取状态，确认 target_endpoint 与派单 brief 一致，notify_endpoint 与已核实接收方一致。
+# --once 不能托管任务；未完成时沿用同一状态文件启动持续监听。
+nohup python3 "$S/task-watch.py" --task-id "$TASK_ID" --target "$TARGET" \
+  --notify "$RECEIVER" --since "$DISPATCH_TS" \
+  --result "$RESULT_FILE" --state "$WATCH_STATE" \
+  --interval 30 --stale-after 300 --timeout 7200 > "$WATCH_LOG" 2>&1 &
+WATCH_PID=$!
+printf '%s\n' "$WATCH_PID" > "$WATCH_PID_FILE"
+kill -0 "$WATCH_PID"
+```
+
+等到首轮状态落盘后读取 `$WATCH_STATE` 和日志，确认本轮任务、目标 endpoint、通知 endpoint 与 PID。启动 PID 存在仍不足以证明首次观察成功。再核对 `events` 中首次事件的 `id/delivered/attempts` 以及 `notify_error`：
+
+```bash
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("notify_endpoint")); print(d.get("notify_error")); print([(e["id"], e["delivered"], e["attempts"]) for e in d["events"]])' "$WATCH_STATE"
+bash "$S/send.sh" --status "$FIRST_EVENT_ID"
+```
+
+事件 `delivered=true` 及信箱 `notified/received/completed` 证明通知已确认提交，仍不能证明接收方已验收任务。首次通知失败且尚未重试成功时不声称托管路由已经验证；保持前台跟进。协调会话收到门铃后必须读取自己的信箱与对应状态文件，按 task_id 恢复任务，不把门铃视作最终结论。普通 running、每轮检查及恢复 running 只写状态，不发通知。重要事件 completion_reported、blocked、approval_required、stalled、idle_unfinished、session_changed、timed_out、unknown、delivery_invalid 才通过 `send.sh --durable` 发短状态指针；对相同事件去重，失败保留队列并按原编号重试。相同状态文件持有互斥锁，避免重复监听。
+
+新通知前缀显示“监听器 / 被监控对象”，来源标签与目标标签随事件落盘；项目主动消息继续使用 send.sh 的项目来源前缀，人工读 UI 即可区分。监听器通过 CMUX_FROM_LABEL 提供展示标签，CMUX_FROM 仍保存原发送身份；项目主动通知不设置该展示变量。来源标签只是展示，不赋予 ACK 身份。旧事件沿用原 sender 显示来源，包括 codex-external；不改原信箱编号、正文或 sender。普通事件含旧 pending running 标记 suppressed，delivered 仍为 false，不再重试也不拖住终止宽限。通知事件在落盘时固定 sender；重启后即使 `CMUX_FROM` 改变，同一事件仍沿用原 sender、编号和正文。旧事件缺少 sender 时从原信箱消息记录恢复，不改写已落盘消息的身份。
+
+没有真实协调接收会话时省略 `--notify`，前台分段运行并读取状态，单次等待不超过 60 秒；不要在回合结束后声称会自动回来。报告完成、身份变化和到期时停止目标观察，仍按固定通知身份重试待发送事件，默认宽限 `--notify-grace 300` 秒；宽限期结束仍未送达时落盘 `delivery_error` 并以 5 退出。无通知路由时仅落盘。此限制必须如实报告，可沿用原参数 `--once` 对账重试，不能声称一定送达。通知接收会话处于忙碌、权限等待或未知状态时保留事件，不向其输入文字，后续沿用原编号重试。通知只是门铃：协调者醒来读状态文件、进度文件和看板，决定下一步。监听脚本不会自主批准、验收或扩大范围。
+
+无进展提醒保存在状态的 `stalled` 布尔字段及同名事件中，恢复后记录恢复事件；它不是强制停工状态。权限框优先报告 `approval_required`，不向目标按键。告诉用户哪个会话、哪项动作、工具给出的理由；继续监听并推进其它独立工作。未知屏幕不当空闲。两轮可靠空闲且无交付时报告 `idle_unfinished`，核实后用原任务短指针提醒继续。无进展告警是检查线索，不强制中断工作。
+
+Codex 可在工作 banner 下方显示可编辑的占位提示，不能据此判空闲；当前工作 banner 优先，明确的权限选择框优先于工作状态。已出现完成 banner 的旧输出不再作为当前权限或工作状态。这些判断仍是文本启发式，不能替代当次进度与独立验收。
+
+若目标和协调接收会话一起重启并改变 endpoint，旧身份通知不能安全投递到新会话；此时无法保证自动唤醒，必须读取 delivery_error/log 后重新核实两端并恢复监听，不承诺无人值守恢复。目标身份改变时旧监听停止，重新现查、读屏、确认当前任务并取得新 endpoint；新绑定使用新的状态文件，要求执行方更新进度归属。时间戳、task_id 或 endpoint 不匹配的旧结果不算交付。监听到期能够续挂时必须续挂，不标记任务完成；环境确实不可用时明确报告阻塞及恢复条件，不能把报告限制当成托管成功。终止状态文件只用于通知对账，不自动恢复目标观察。任务到期后续挂，先核对原监听已结束及当前 endpoint 未漂移，再使用新的状态路径和监听期限，保留原 task_id、派单时间及未决记录；不要靠反复重启已终止的状态文件续挂。用户取消或暂停时根据已核实 PID 停止进程并更新看板；不会自动读取用户聊天来停止。
+
+## 3. 有证据地共同讨论
+
+发现契约矛盾、边界遗漏或实现风险时，只联系本任务相关成员。长问题写文件，短消息带 task_id 和问题编号。讨论记录最少包含：问题、实际文件与版本、影响、建议和负责回应的人。对方必须核对自己的代码或 spec，可以拿证据反驳协调者。
+
+例如前后端 `schemaRevision` 一边数字、一边字符串：生产方先给出当前序列化和校验事实，消费方核对页面状态与请求；双方讨论兼容性并修订各自产物。协调者检查旧接口调用是否也更新，不能用“两边单测过了”代替契约验收。
+
+`board.sh --ask` 记录待决及 owner；`--decide` 的理由写清证据来源、日期或版本、适用范围。契约改变后通知消费方回读，消费方更新自己的 spec 并说明验证结果。技术一致可以形成推荐方案；涉及用户业务选择、范围扩展或真实权限时由用户决定。团队意见不能替代该决定。
+
+不要让多个会话反复向用户问同一个问题。协调者汇总一份有证据、明确影响和建议的问题，指定决定人；其它会话继续不依赖该答案的工作。已授权范围内的接口、表结构调整按职责推进并同步相关方，不因“改结构”一律停工。
+
+## 4. 独立验收与整改
+
+收到 `completion_reported` 后将看板置为 `reviewing`。读取实际产物、当前 diff/提交以及验证记录，核对需求、原型、契约和待决项。按风险亲自执行必要检查：文档交付可检查需求编号、示例合法性和字段一致性；实现改动运行相应测试或构建。不要无条件重跑全量构建，也不要在同一工作目录并行跑 Maven。
+
+问题写进整改文件并派给原仓库负责人，沿用原工作项关联，更新验收条件；整改轮次关联原工作项，但采用新的监控 task_id、派单时间和状态文件，要求执行方写入该轮进度；这样不会再次接受上一轮 completed。重新监听新的交付轮次。通过后看板标为 `accepted`，清理已经结束的监听，向用户汇报实际结果、验证和仍待决定的事项。仅提交后告知用户可以自行推送，本技能不执行 push。
+
+协调者的完成标准是共同目标已经验收。各方分别说 done、HEAD 变动、看板写 completed、监听退出，都不能单独满足这个标准。

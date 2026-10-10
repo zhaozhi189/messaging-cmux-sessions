@@ -309,7 +309,7 @@ if [ "$ADD_FROM" = 1 ] && [ -n "$from" ] && ! printf '%s' "$MSG" | grep -q '^(fr
   elif [ -n "$REPLY_CORR" ]; then
     prefix="(from $from)[回复 $REPLY_CORR] "
   else
-    prefix="(from $from) "
+    prefix="(from ${CMUX_FROM_LABEL:-$from}) "
   fi
   MSG="$prefix$MSG"
   PRELEN=${#prefix}

@@ -162,7 +162,8 @@ messaging-cmux-sessions/
 ├── cmux-sessions.example.conf      # 全局注册表样例
 ├── references/
 │   ├── collaboration-patterns.md   # 进阶:文件信箱+ack、旁路审计、组看板、协作约定
-│   └── claude-legacy-guide.md      # 旧版 Claude 行为与排障经验
+│   ├── claude-legacy-guide.md      # 旧版 Claude 行为与排障经验
+│   └── team-workflow.md            # 团队派单、持续监听、讨论与验收
 ├── scripts/
 │   ├── send.sh                     # 定位 + 查空闲 + 发送 + 验证 + 补 CR;--peek 探测卡箱
 │   ├── sessions.sh                 # 会话发现 + 项目关联(在线/忙闲/仓库路径)
@@ -171,9 +172,11 @@ messaging-cmux-sessions/
 │   ├── pending.sh                  # 待回复台账(send.sh --ask 的账);--group 组级视图
 │   ├── watch.sh                    # 零 token 看护:等空闲 / 盯账龄,条件满足注入唤醒
 │   ├── busy-hook.sh                # 生命周期回调:写语义化忙/闲状态
-│   └── protocol.py                 # 结构化发现、持久信箱与会话身份校验
+│   ├── protocol.py                 # 结构化发现、持久信箱与会话身份校验
+│   └── task-watch.py               # 当次任务监听与持久事件通知
 └── tests/
-    └── test_send.py                # 模拟 cmux 的发送与协议回归测试
+    ├── test_send.py                # 模拟 cmux 的发送与协议回归测试
+    └── test_task_watch.py          # 模拟 cmux 的任务监听与通知测试
 ```
 
 ## 多会话协作(3 个以上)
@@ -188,7 +191,7 @@ $S/watch.sh idle --group <组>        # 组内任一成员空闲就唤醒协调�
 ```
 
 **广播只用于「通知」,派活优先用 `--durable` 持久信箱，长内容写文件后发指针**；旧的 `--ask` 台账保留兼容。对话里定下的决策
-当场 `board.sh --decide` 落盘——「已定」栏是唯一真相源。详见 `references/collaboration-patterns.md`。
+当场 `board.sh --decide` 落盘，注明证据、版本和适用范围；旧决策不能覆盖用户最新指令。详见 `references/collaboration-patterns.md`。
 
 ## 故障排查
 
@@ -233,16 +236,17 @@ watcher 只有在确认投递成功时删除唤醒记录，读屏失败不会判
 
 ```bash
 python3 tests/test_send.py
+python3 tests/test_task_watch.py
 ```
 
-该测试使用模拟 cmux，不会向真实会话发送消息。覆盖 Codex 提示符、普通 shell、已有草稿、读屏失败、发送后状态丢失、多行拒发、回复台账和目标锁冲突。
+这些测试使用模拟 cmux，不会向真实会话发送消息。覆盖发送防护、回复台账、目标锁、当次任务身份、进度时间戳、通知优先级与终止后的重试宽限。
 
 
 ## 外部进程访问
 
 cmux 的 `automation.socketControlMode` 应设为 `automation`，允许同一 macOS 用户的外部进程访问本机 socket。该授权与 Codex 脚本审批规则分别生效。访问失败时 `send.sh --list` 返回非零并保留原始错误，不把失败报告成没有会话。
 
-外部进程没有 cmux 来源 surface，不要伪造 `CMUX_SURFACE_ID`。普通发送可设置 `CMUX_FROM=codex-external` 标明来源；需要 `--ask` 时同样设置来源名，并在 brief 中指定回复文件。若有真实的回复接收会话，可设置 `CMUX_REPLY_TO=surface:N`；该编号必须现查。没有真实接收会话时由外部调用方读取回复文件，不使用 watcher 自唤醒。
+外部进程没有 cmux 来源 surface，不要伪造 `CMUX_SURFACE_ID`。普通发送可设置 `CMUX_FROM=codex-external` 标明来源；需要 `--ask` 时同样设置来源名，并在 brief 中指定回复文件。若有真实的回复接收会话，可设置 `CMUX_REPLY_TO=surface:N`；该编号必须现查。没有真实接收会话时由外部调用方前台读取回复文件；任务监听可用 `--notify` 显式绑定已验证的协调接收会话，不伪造 caller。
 
 修改 socket 模式后执行 `cmux reload-config` 并用外部进程实际测试；若运行实例仍拒绝连接，需从 Automation 设置应用模式，或安排重启 cmux，不能把配置已写入当成已生效。
 
@@ -278,3 +282,13 @@ bash "$S/send.sh" --status m原消息编号
 忙闲 hook 状态写入 `busy-v2/`，采用锁、原子替换及递增写入序号，绑定 workspace UUID、tty、surface。默认有效期 120 秒，可用 `CMUX_BUSY_TTL` 调整；旧格式、损坏、过期或身份不匹配均视为 unknown，再由调用方读取屏幕。序号表示加锁后的写入顺序，不能证明上游生命周期事件的发生顺序。现有 hooks 必须实际正常运行才能提供可靠状态；同一终端中重启 agent 但未改变 endpoint 的情况仍需生命周期正确清理，不能仅靠 endpoint 识别。
 
 终端输入继续只发送一次正文或通知，补交只重试回车。读屏验证是启发式，持久信箱的接收确认比“输入框文本消失”更强。新命令仍通过已授信的 send.sh 入口调用，无需额外授信 protocol.py。
+
+## 团队协作闭环
+
+有交付的派单默认附 task_id、仓库负责人、依赖、契约职责、产物和进度文件，并启动 `task-watch.py`。默认每 30 秒观察，5 分钟无进展提醒，2 小时监听到期；后台运行需核实 PID、首次状态及真实唤醒目标。外部 caller=null 可显式 `--notify surface:N`，不冒充来源身份。
+
+监听区分权限等待、未交付的空闲、未知状态、会话身份变化和当次交付。通知只在状态变化时发送，失败沿用同消息编号重试。`completion_reported` 表示等待验收；协调者检查实际文件、diff 与跨项目契约后才标记 `accepted`。到期需要续挂或处理，不能当作任务完成。
+
+团队讨论围绕证据和具体问题：生产方给出口径，消费方回读验证，各自在自己的仓库改动，协调者记录决策、整合待决项并验收。权限框由用户在目标会话处理；监听器不按键、不代批。
+
+命令、进度 JSON、托管步骤与整改流程见 [团队工作流](references/team-workflow.md)。测试使用模拟 cmux，不向真实会话发送消息。
