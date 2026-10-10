@@ -32,18 +32,20 @@
 #   CMUX_MSG_DIR  台账/忙闲状态目录(默认 ~/.claude/cmux-messaging)
 #
 # 退出码:
-#   0  已确认提交(或目标已明确排队);--peek 时 = 箱空(含 ghost text)
+#   0  操作成功；发送确认不代表任务完成；--peek 时 = 箱空(含 ghost text)
 #   1  没找到目标会话
 #   2  目标忙,消息留在其输入框(可能已被 TUI 排队)—— 先重查再决定是否 --flush
 #      --peek 时 = 箱里确有未提交文本
 #   3  多次补 CR 仍残留,需人工查看;--peek 时 = 目标忙,无法探测
 #   4  用法错误 / 目标不明确(标题重名)
 #   5  目标没有 agent 输入框(死壳/普通 shell)—— 给 shell 执行命令请用裸 cmux send
+#   6  会话发现或持久协议错误
 #
-# 依赖:cmux >= 0.64,bash 3.2+,awk。无其他依赖。
+# 依赖:cmux >= 0.64、bash 3.2+、Python 3.8+、awk/grep/sed。
 set -euo pipefail
 
-CMUX=$(command -v cmux || echo /Applications/cmux.app/Contents/Resources/bin/cmux)
+CMUX=${CMUX_BIN:-$(command -v cmux || echo /Applications/cmux.app/Contents/Resources/bin/cmux)}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REGISTRY="${CMUX_SESSIONS_CONF:-$HOME/.claude/cmux-sessions.conf}"
 MSGDIR="${CMUX_MSG_DIR:-$HOME/.claude/cmux-messaging}"
 
@@ -51,22 +53,10 @@ die() { echo "$@" >&2; exit 4; }
 
 # ── 会话清单:ref|window|workspace|title,一次拿全(含未选中的 workspace)────────
 list_surfaces() {
-  "$CMUX" tree --all 2>/dev/null | awk '
-    # 取行内第一对双引号中的内容
-    function quoted(s,   i, r, j) {
-      i = index(s, "\""); if (i == 0) return ""
-      r = substr(s, i + 1); j = index(r, "\"")
-      return j ? substr(r, 1, j - 1) : ""
-    }
-    /^window /              { if (match($0, /window:[0-9]+/))    win = substr($0, RSTART, RLENGTH); next }
-    / workspace workspace:/ { if (match($0, /workspace:[0-9]+/)) ws  = substr($0, RSTART, RLENGTH)
-                              wst = quoted($0); next }
-    / surface surface:/     { if (!match($0, /surface:[0-9]+/)) next
-                              ref = substr($0, RSTART, RLENGTH)
-                              i = index($0, "] \"")            # 标题跟在 [terminal] 之后
-                              print ref "|" win "|" wst "|" (i ? quoted(substr($0, i + 1)) : "")
-                            }
-  '
+  python3 "$SCRIPT_DIR/protocol.py" list || {
+    echo "✗ 无法连接或发现 cmux 会话；连接或结构错误不等于没有目标。" >&2
+    return 6
+  }
 }
 
 # ── 注册表:把别名翻译成 tab 标题(可选,文件不存在就跳过)──────────────────────
@@ -111,7 +101,7 @@ resolve() {
 }
 
 # 本会话身份(用于来源前缀 + 防自发自收)
-self_ref() { "$CMUX" identify 2>/dev/null | awk -F'"' '/"surface_ref"/ { print $4; exit }'; }
+self_ref() { python3 "$SCRIPT_DIR/protocol.py" self; }
 self_title() {
   local me; me=$(self_ref) || return 1
   [ -n "$me" ] || return 1
@@ -120,6 +110,13 @@ self_title() {
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 [ $# -ge 1 ] || die "用法: send.sh <目标> <消息> | send.sh <目标> --flush '<签名>' | send.sh --list"
+
+case "$1" in
+  --inbox) shift; exec python3 "$SCRIPT_DIR/protocol.py" inbox "$@" ;;
+  --ack) shift; exec python3 "$SCRIPT_DIR/protocol.py" ack "$@" ;;
+  --complete) shift; exec python3 "$SCRIPT_DIR/protocol.py" complete "$@" ;;
+  --status) shift; exec python3 "$SCRIPT_DIR/protocol.py" status "$@" ;;
+esac
 
 if [ "$1" = "--list" ]; then
   printf 'SURFACE\tWORKSPACE\tWINDOW\tTITLE\n'
@@ -130,18 +127,22 @@ fi
 TARGET="$1"; shift
 [ $# -ge 1 ] || die "缺少消息文本"
 
-ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""; PEEK=0
+ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""; PEEK=0; DURABLE=0; MESSAGE_ID=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --flush)   FLUSH_SIG="${2:-}"; [ -n "$FLUSH_SIG" ] || die "--flush 缺少签名参数"; shift 2 ;;
     --no-from) ADD_FROM=0; shift ;;
     --dry-run) DRY=1; shift ;;
     --ask)     ASK=1; shift ;;
+    --durable) DURABLE=1; shift ;;
+    --id) MESSAGE_ID="${2:-}"; [ -n "$MESSAGE_ID" ] || die "--id 缺少编号"; shift 2 ;;
     --peek)    PEEK=1; shift ;;
     --reply)   REPLY_CORR="${2:-}"; [ -n "$REPLY_CORR" ] || die "--reply 缺少关联号参数"; shift 2 ;;
     *)         MSG="$1"; shift ;;
   esac
 done
+[ "$DURABLE" = 1 ] && { [ "$ASK" = 0 ] && [ -z "$REPLY_CORR" ] && [ "$PEEK" = 0 ] && [ -z "$FLUSH_SIG" ]; } || { [ "$DURABLE" = 0 ] || die "--durable 不与 ask/reply/peek/flush 混用"; }
+[ -z "$MESSAGE_ID" ] || [ "$DURABLE" = 1 ] || die "--id 只用于 --durable"
 [ "$ASK" = 1 ] && [ -n "$REPLY_CORR" ] && die "--ask 与 --reply 不能同时使用"
 
 row=$(resolve "$TARGET")
@@ -162,17 +163,16 @@ read_tail() { "$CMUX" read-screen --window "$win" --surface "$ref" --scrollback 
 
 # 当前输入框 = 屏幕上最后一个 ❯(Claude)/ ›(Codex)行。
 # ⚠️ 读 ≥40 行:长消息会 wrap,只读末尾几行会被状态栏挤掉 ❯ 行 → 误判"已提交"。
-box_line() { read_tail 40 | grep -E '❯|›' | tail -1 || true; }
-# 语义忙闲(busy-hook.sh 经 Claude Code hooks 写入):busy|idle|unknown。
-# 文件缺失或超过 2 小时 = unknown(绝不升格为 idle/busy);unknown 时退回读屏启发式。
-sem_state() {
-  local f="$MSGDIR/busy/${ref//:/_}" st ts
-  [ -f "$f" ] || { printf 'unknown'; return; }
-  st=$(awk -F= '$1=="state"{print $2; exit}' "$f")
-  ts=$(awk -F= '$1=="ts"{print $2; exit}' "$f")
-  if [ -z "$ts" ] || [ $(( $(date +%s) - ts )) -ge 7200 ]; then printf 'unknown'; return; fi
-  printf '%s' "${st:-unknown}"
+box_line() {
+  local screen
+  screen=$(read_tail 40) || return 1
+  [ -n "$screen" ] || return 1
+  printf '%s\n' "$screen" | grep -E '^[[:space:]]*[❯›][[:space:]]' | tail -1 || true
 }
+# 语义忙闲(busy-hook.sh 经 Claude Code hooks 写入):busy|idle|unknown。
+# 文件缺失、身份不匹配或超过 CMUX_BUSY_TTL（默认 120 秒）时为 unknown。
+sem_state() { python3 "$SCRIPT_DIR/protocol.py" busy "$ref" 2>/dev/null || printf unknown; }
+
 # 判忙:语义状态优先(hooks 是权威),unknown 才用屏幕启发式。
 # 屏幕启发式只看末尾 15 行——加了 --scrollback 后,更早的历史里会有过期的忙碌行。
 is_busy() {  # <已抓取的屏幕内容>
@@ -180,12 +180,17 @@ is_busy() {  # <已抓取的屏幕内容>
     busy) return 0 ;;
     idle) return 1 ;;
   esac
-  printf '%s' "$1" | tail -15 | grep -qE 'esc to interrupt|… \('
+  printf '%s' "$1" | tail -15 | grep -qiE 'esc to interrupt|esc to cancel|… \('
 }
 # 提交确认后的 settle:确认只证明文本被接收,对方 harness 起 turn 还要约 1 秒,
 # 立刻读屏会看到陈旧的空闲画面而误判。SEND_SETTLE=0 关闭。
 # --reply 的消账也在这里做:只有投递确认成功才消(送达 ≠ 已回,但回复本身送达即闭环)。
 ok() {
+  if [ -n "${MESSAGE_ID:-}" ]; then
+    python3 "$SCRIPT_DIR/protocol.py" notified "$MESSAGE_ID" || {
+      echo "⚠️ 通知已提交但状态记录失败，请核查原编号，不要重发正文"; exit 3;
+    }
+  fi
   if [ -n "${REPLY_CORR:-}" ] && [ -f "$MSGDIR/pending/$REPLY_CORR" ]; then
     mkdir -p "$MSGDIR/done"
     printf 'replied_at=%s\nreplied_by=%s\n' "$(date +%s)" "${from:-?}" >> "$MSGDIR/pending/$REPLY_CORR"
@@ -196,11 +201,27 @@ ok() {
 }
 # ⚠️ 判据只能是「箱里有没有本条消息的签名」,不能是「箱里有没有字」——
 #    Claude Code 会在输入框显示灰色建议词(ghost text),读屏时与卡箱文本无法区分。
-msg_in_box() { [ -n "$1" ] && box_line | grep -qF "$1"; }
+msg_in_box() {
+  local line
+  line=$(box_line) || return 0
+  [ -n "$line" ] || return 0
+  [ -n "$1" ] && printf '%s\n' "$line" | grep -qF "$1"
+}
+
+# mkdir 锁在同机不同进程间生效；残留锁需要人工核查，不自动抢占。
+if [ "$DRY" != 1 ]; then
+  LOCK_ROOT="${CMUX_SEND_LOCK_DIR:-$MSGDIR/send-locks}"
+  mkdir -p "$LOCK_ROOT"
+  SEND_LOCK="$LOCK_ROOT/${ref//:/_}"
+  mkdir "$SEND_LOCK" 2>/dev/null || die "✗ 目标正在被另一发送进程操作，或存在残留锁: $SEND_LOCK"
+  printf '%s\n' "$$" > "$SEND_LOCK/pid"
+  trap 'rm -f "$SEND_LOCK/pid"; rmdir "$SEND_LOCK" 2>/dev/null || true' EXIT
+fi
 
 # ── --flush:补交卡在目标输入框里的消息 ────────────────────────────────────────
 if [ -n "$FLUSH_SIG" ]; then
   if msg_in_box "$FLUSH_SIG"; then
+    is_busy "$(read_tail 40)" && { echo "⚠️ 目标忙，暂不补交"; exit 2; }
     "$CMUX" send --window "$win" --surface "$ref" '\r' >/dev/null; sleep 2
     msg_in_box "$FLUSH_SIG" && { echo "⚠️ flush 后仍残留 $ref"; exit 3; }
     ok "✓ 已补交 → $ref ($tgt_title)"
@@ -243,11 +264,33 @@ if [ "$PEEK" = 1 ]; then
 fi
 
 [ -n "$MSG" ] || die "缺少消息文本"
+[ "$DURABLE" = 1 ] || case "$MSG" in
+  *$'\n'*|*$'\r'*|*$'\033'*) die "消息不能含换行、回车或 ESC，请写文件后发送指针" ;;
+esac
+[ -z "$REPLY_CORR" ] || [[ "$REPLY_CORR" =~ ^a[0-9]+-[0-9]+$ ]] || die "关联号格式不正确"
 
 # ── 来源前缀:不带来源的注入消息,对方无法与真人指令区分 ──────────────────────
 # 斜杠命令是指令不是聊天,加了前缀就不再是斜杠命令(变成 "(from x) /cmd"),必须跳过。
 case "$MSG" in /*) ADD_FROM=0 ;; esac
-from=$(self_title || true)
+from=${CMUX_FROM:-$(self_title || true)}
+
+if [ "$DURABLE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then
+    echo "目标: $ref ($win, $tgt_title)"; echo "持久消息正文: $MSG"; exit 0
+  fi
+  from=${from:-codex-external}
+  if [ -n "$MESSAGE_ID" ]; then
+    MESSAGE_ID=$(python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "$from" "$MSG" "$MESSAGE_ID")
+  else
+    MESSAGE_ID=$(python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "$from" "$MSG")
+  fi
+  echo "消息已落盘: ${MESSAGE_ID}；重试必须沿用 --id 和原正文，不能重复派活。"
+  status=$(python3 "$SCRIPT_DIR/protocol.py" status "$MESSAGE_ID")
+  if printf '%s' "$status" | grep -qE '"state": "(notified|received|completed)"'; then
+    echo "已有通知或接收记录，不再发送通知；可用 --status 查询"; exit 0
+  fi
+  MSG="请查 cmux 收件箱：$MESSAGE_ID"
+fi
 
 # --ask/--reply 的结构化标记依赖来源身份(对方要知道回给谁/消谁的账)。
 CORR=""
@@ -273,13 +316,15 @@ if [ "$ADD_FROM" = 1 ] && [ -n "$from" ] && ! printf '%s' "$MSG" | grep -q '^(fr
 fi
 # 需回复的请求在尾部附上回复方式——对方(可能是没装本 skill 的 Codex)才知道怎么消账。
 if [ -n "$CORR" ]; then
-  MSG="$MSG (回复方式: bash ~/.claude/skills/messaging-cmux-sessions/scripts/send.sh $from --reply $CORR '<答复>')"
+  printf -v reply_script '%q' "$SCRIPT_DIR/send.sh"
+  printf -v reply_target '%q' "${CMUX_REPLY_TO:-$me}"
+  MSG="$MSG [回复: $CORR]"
 fi
 
 # 签名 = 消息开头若干字符,必须落在 ❯ 那一行内(wrap 只影响后续行)。
 # 前缀本身不能当签名——同一发送方的每条消息前缀都一样,会互相误判;
-# 所以签名长度 = 前缀长度 + 正文前 12 个字符。cut -c 按字符切,不会切坏中文。
-SIG=$(printf '%s' "$MSG" | LC_ALL=en_US.UTF-8 cut -c1-$((PRELEN + 12)))
+# 所以签名长度 = 前缀长度 + 正文前 12 个字符，按 Unicode 字符截取。
+SIG=$(python3 -c 'import sys; print(sys.argv[1][:int(sys.argv[2])])' "$MSG" "$((PRELEN + 12))")
 
 # ── ⭐ 长度闸门:超长消息必然 wrap,而 wrap 会同时打破两条验证前提 ────────────────
 #    ① 签名假设「必落在 ❯ 那一行内」——箱里已堆着上一条时,本条签名落在中间行;
@@ -308,7 +353,7 @@ for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
     n = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line.rstrip())
     w = max(w, n)
 print(w)
-' 2>/dev/null)
+' 2>/dev/null) || term_cols=100
 [ "${term_cols:-0}" -lt 60 ] && term_cols=100      # 读不到/异常窄就取保守值,宁可误拒不可漏放
 SAFE_COLS=$((term_cols - 8))                        # 留出提示符与光标的余量
 MSGCHARS=$(disp_width "$MSG")
@@ -344,12 +389,26 @@ if [ -z "$(box_line)" ]; then
   exit 5
 fi
 
+# 不覆盖已有输入；Codex 占位提示文本只在明确匹配默认提示时放行。
+current=$(box_line) || { echo "✗ 读屏失败，拒绝发送"; exit 5; }
+input=$(printf '%s' "$current" | sed -E 's/^[[:space:]]*[❯›][[:space:]]*//; s/[[:space:]]+$//')
+case "$input" in
+  ''|'Ask Codex to do anything'|'Implement {feature}'|'Find and fix a bug in @filename'|'Write tests for @filename'|'Summarize recent commits'|'Improve documentation in @filename'|'Explain this codebase') ;;
+  *) echo "✗ 目标输入框已有文本或未识别的建议词，拒绝追加；请先确认输入状态"; exit 3 ;;
+esac
+
 # ── 需回复的请求:投递前先落台账(先记账再送达,进程死了账也不丢)──────────────
 if [ -n "$CORR" ]; then
   mkdir -p "$MSGDIR/pending"
   printf 'from=%s\nto=%s\ntarget=%s\nts=%s\nmsg=%s\n' \
     "$from" "$tgt_title" "$ref" "$(date +%s)" \
     "$(printf '%s' "$MSG" | LC_ALL=en_US.UTF-8 cut -c1-120)" > "$MSGDIR/pending/$CORR"
+  printf 'reply_script=%s\nreply_target=%s\n' "$SCRIPT_DIR/send.sh" "${CMUX_REPLY_TO:-$me}" >> "$MSGDIR/pending/$CORR"
+  if [ -n "${CMUX_REPLY_TO:-$me}" ]; then
+    echo "回复命令: bash $reply_script $reply_target --reply $CORR '<答复>'"
+  else
+    echo "外部调用方无 cmux surface：请在 brief 中约定回复文件，不向空目标发消息。"
+  fi
 fi
 
 # ── 发送:一条消息 + 一个 CR。中间绝不能有 \n / \r,否则变成换行而非提交。────
@@ -374,10 +433,7 @@ esac
 BUSY=0
 for wait in 1 1 2 3 5 8; do
   sleep "$wait"
-  scr=$(read_tail 40)
-  if printf '%s' "$scr" | grep -qE "Press up to edit|queued message"; then
-    ok "✓ 已排队(队列提示确认) → $ref ($tgt_title)"
-  fi
+  scr=$(read_tail 40) || { echo "⚠️ 发送后读屏失败，投递状态未知，请勿直接重发"; exit 3; }
   if ! msg_in_box "$SIG"; then
     ok "✓ 已提交 → $ref ($tgt_title)"
   fi

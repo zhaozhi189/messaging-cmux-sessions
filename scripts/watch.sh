@@ -43,17 +43,13 @@ self_title() { "$S_DIR/send.sh" --list 2>/dev/null | awk -F'\t' -v r="$SELF_REF"
 
 # ── 判忙(与 send.sh 同口径):语义文件优先,unknown 读屏 ────────────────────────
 busy_of() {  # <ref> <win> ; 退出码 0=忙 1=闲
-  local f="$MSGDIR/busy/${1//:/_}" st ts
-  if [ -f "$f" ]; then
-    st=$(awk -F= '$1=="state"{print $2; exit}' "$f")
-    ts=$(awk -F= '$1=="ts"{print $2; exit}' "$f")
-    if [ -n "$ts" ] && [ $(( $(date +%s) - ts )) -lt 7200 ]; then
-      [ "$st" = busy ] && return 0
-      [ "$st" = idle ] && return 1
-    fi
-  fi
-  "$CMUX" read-screen --window "$2" --surface "$1" --scrollback --lines 15 2>/dev/null \
-    | grep -qE 'esc to interrupt|… \(' && return 0
+  local state
+  state=$(python3 "$S_DIR/protocol.py" busy "$1" 2>/dev/null) || state=unknown
+  case "$state" in busy) return 0 ;; idle) return 1 ;; esac
+  local screen
+  screen=$("$CMUX" read-screen --window "$2" --surface "$1" --scrollback --lines 15 2>/dev/null) || return 0
+  printf '%s\n' "$screen" | grep -qE '^[[:space:]]*[❯›][[:space:]]' || return 0
+  printf '%s\n' "$screen" | grep -qiE 'esc to interrupt|esc to cancel|… \(' && return 0
   return 1
 }
 
@@ -64,7 +60,7 @@ wake_once() {  # <消息>
   qf="$QDIR/$(date +%s)-$$"
   printf '%s\n' "$msg" > "$qf"
   SEND_SELF_OK=1 SEND_SETTLE=0 "$S_DIR/send.sh" "$SELF_REF" --no-from "$msg" >/dev/null 2>&1 || rc=$?
-  if [ "$rc" -le 2 ] && [ "$rc" -ne 1 ]; then rm -f "$qf"; return 0; fi
+  if [ "$rc" = 0 ]; then rm -f "$qf"; return 0; fi
   return 1
 }
 notify() {  # <消息> —— 注入失败(如 cmux 重启导致 ref 失效)时退避重试,队列文件兜底

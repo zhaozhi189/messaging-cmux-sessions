@@ -15,7 +15,7 @@
 # 注册表:${CMUX_SESSIONS_CONF:-~/.claude/cmux-sessions.conf}
 #   格式(| 分隔,# 注释):  别名 | cmux tab 标题 | 仓库路径 | 分组 | 说明
 #
-# 依赖:cmux >= 0.64,bash 3.2+,awk。无其他依赖。
+# 依赖:cmux >= 0.64、bash 3.2+、Python 3.8+、awk/grep/sed。
 set -euo pipefail
 
 CMUX=$(command -v cmux || echo /Applications/cmux.app/Contents/Resources/bin/cmux)
@@ -42,9 +42,12 @@ surfaces() { "$HERE/send.sh" --list | tail -n +2 | awk -F'\t' '{print $1 "|" $3 
 # 忙/闲:末尾出现 "esc to interrupt" 或进行时 spinner(`…（Ns）`)= 忙。
 # 注意 "Brewed for"/"Cogitated for" 这类**过去式**是已完成,不是忙。
 probe() {
-  local ref="$1" win="$2" scr
+  local ref="$1" win="$2" scr semantic
+  semantic=$(python3 "$HERE/protocol.py" busy "$ref" 2>/dev/null) || semantic=unknown
+  case "$semantic" in busy|idle) echo "$semantic"; return ;; esac
   scr=$("$CMUX" read-screen --window "$win" --surface "$ref" --lines 12 2>/dev/null) || { echo "?"; return; }
-  printf '%s' "$scr" | grep -qE 'esc to interrupt|… \(' && { echo busy; return; }
+  printf '%s' "$scr" | grep -qiE 'esc to interrupt|esc to cancel|… \(' && { echo busy; return; }
+  printf '%s\n' "$scr" | grep -qE '^[[:space:]]*[❯›][[:space:]]' || { echo unknown; return; }
   echo idle
 }
 
