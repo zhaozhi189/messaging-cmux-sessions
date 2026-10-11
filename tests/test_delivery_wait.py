@@ -103,10 +103,23 @@ elif cmd=='send':
         self.options['screen']='• Working (1m • esc to interrupt)\n› '
         state=self.run_wait('--timeout','.05','--interval','.01',once=False,expected=5)
         self.assertEqual(state['status'],'timed_out')
+        self.assertEqual(state['exit_code'], 5)
+        self.assertEqual(state['deadline_at'], state['started_at'] + state['timeout'])
         self.assertEqual(json.loads(self.record.read_text())['state'],'recorded')
         self.options['screen']='› '
         self.run_wait(expected=5)
         self.assertEqual(self.run_wait('--resume')['status'],'notified')
+
+    def test_observable_pending_and_delivered_exit_codes(self):
+        self.options['screen'] = '› 用户草稿'
+        state = self.run_wait(expected=2)
+        self.assertEqual(state['exit_code'], 2)
+        self.assertFalse(state['delivered'])
+        self.assertEqual(state['deadline_at'], state['started_at'] + 1800)
+        self.options['screen'] = '› '
+        state = self.run_wait()
+        self.assertEqual(state['exit_code'], 0)
+        self.assertTrue(state['delivered'])
 
     def test_real_codex_footer_allows_empty_box_and_owned_notice(self):
         footer = ('\n  GPT-6.1-Sol medium · messaging-cmux-sessions · main · Context 39% used · weekly 80% left · 0.162.0'

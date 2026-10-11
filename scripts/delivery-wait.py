@@ -179,7 +179,8 @@ def main():
             data = message(args.id)
             if identity(data) != {k: state[k] for k in identity(data)}:
                 raise ValueError('原信箱消息身份已改变，停止旧任务')
-            state.update(checked_at=time.time(), pid=os.getpid())
+            state.update(checked_at=time.time(), pid=os.getpid(), timeout=args.timeout,
+                         deadline_at=state['started_at'] + args.timeout, exit_code=None)
             if data['state'] in FINAL:
                 status = data['state']
             elif state.get('status') == 'timed_out' or time.time() - state['started_at'] >= args.timeout:
@@ -205,6 +206,8 @@ def main():
                 state['error'] = '本轮等待到期，未送达；核实原任务及endpoint后用原参数 --resume 续挂，不把超时当完成'
             elif status == 'session_changed':
                 state['error'] = '目标endpoint已改变，停止旧路由；需重新现查并决定任务归属，禁止盲目续挂'
+            state['exit_code'] = (0 if status in FINAL else 6 if status == 'session_changed'
+                                  else 5 if status == 'timed_out' else 2 if args.once else None)
             protocol.atomic(args.state, state)
             print(json.dumps(dict(message_id=args.id, status=status, state=str(args.state)), ensure_ascii=False), flush=True)
             if status in FINAL:
