@@ -177,6 +177,8 @@ messaging-cmux-sessions/
 │   └── task-watch.py               # 当次任务监听与持久事件通知
 └── tests/
     ├── test_send.py                # 模拟 cmux 的发送与协议回归测试
+    ├── test_protocol.py            # 外部进程只读消息与接收身份边界测试
+    ├── test_delivery_wait.py       # 原编号投递等待与安全重试测试
     └── test_task_watch.py          # 模拟 cmux 的任务监听与通知测试
 ```
 
@@ -205,6 +207,7 @@ $S/watch.sh idle --group <组>        # 组内任一成员空闲就唤醒协调�
 | 发了但对方毫无反应 | 消息卡在它输入框没提交 | `cmux read-screen --lines 40` 确认;`send.sh` 会自动补 CR |
 | 对方回复一直没到你这 | 它发消息时没带 `\r` | `read-screen` **你自己的** surface,补一个 `\r` 吃进来 |
 | 一个 `\r` 让对方重跑了上一条 | 往空输入框补了 `\r`,TUI 重放上一条输入 | 补之前先读 ≥30 行确认文本确实跟在 `❯` 后 |
+| `外部进程没有接收会话身份` | 当前工具进程没有真实 caller，不能确定自己的收件箱或确认接收 | 已知编号时用 `send.sh --status <编号>` 读完整正文；按 brief 写进度与结果文件，不执行 `--inbox/--ack/--complete`，不取 focused 冒充 caller |
 | 退出码 6 | cmux 访问失败、JSON 结构不兼容或持久协议错误 | 查看原始错误，核对访问权限、cmux 版本和消息身份；不将失败当作空列表 |
 
 ## 已知限制
@@ -237,10 +240,12 @@ watcher 只有在确认投递成功时删除唤醒记录，读屏失败不会判
 
 ```bash
 python3 tests/test_send.py
+python3 tests/test_protocol.py
+python3 tests/test_delivery_wait.py
 python3 tests/test_task_watch.py
 ```
 
-这些测试使用模拟 cmux，不会向真实会话发送消息。覆盖发送防护、回复台账、目标锁、当次任务身份、进度时间戳、通知优先级与终止后的重试宽限。
+这些测试使用模拟 cmux，不会向真实会话发送消息。覆盖发送防护、回复台账、目标锁、无 caller 时的只读正文与确认拒绝、当次任务身份、进度时间戳、通知优先级与终止后的重试宽限。
 
 
 ## 外部进程访问
@@ -262,17 +267,25 @@ bash "$S/send.sh" demo-backend --durable '请阅读 /private/tmp/task.md，并�
 # 输出消息编号；重试沿用编号及原正文：
 bash "$S/send.sh" demo-backend --durable --id m原消息编号 '请阅读 /private/tmp/task.md，并按其中要求返回验收结果'
 
-# 接收方在自己的真实 cmux 会话中执行：
-bash "$S/send.sh" --inbox
-bash "$S/send.sh" --ack m原消息编号
-# 工作完成且验收证据已按 brief 约定保存后：
-bash "$S/send.sh" --complete m原消息编号
-
-# 发送方查询状态：
+# 收到指定编号后先只读完整正文；caller=null 也可执行：
 bash "$S/send.sh" --status m原消息编号
+cmux identify
 ```
 
-收到“请查 cmux 收件箱”通知时，先执行 `--inbox` 读取对应编号的完整正文，再 `--ack` 确认接收。不要把通知文本当作完整任务。`--complete` 是接收方显式声明完成，发送方仍需独立验收；该命令不会证明测试已通过。
+收到“请查 cmux 收件箱：<编号>”通知时，先执行 `--status <编号>` 读取完整正文，再完整读取正文指向的 brief，不把门铃当作完整任务。`--status` 不调用 cmux、不修改消息状态。
+
+`caller=null` 时不执行 `--inbox/--ack/--complete`，不取 `focused` 或伪造 `CMUX_SURFACE_ID`。在既定授权范围内继续处理任务、更新约定的进度与结果文件，并记录“协议接收确认不可用”，由协调者直接回读产物。caller 属于其他会话或 endpoint 已改变时，先核实归属，不冒用接收身份。只有记录中的真实目标且 endpoint 仍匹配时，才读取后 `--ack`、交付后 `--complete`。
+
+读取正文或产物存在不会自动产生 ACK，不能据此手改 `received/completed`。`--complete` 是接收方显式声明完成，发送方仍需独立验收；该命令不会证明测试已通过。
+
+以下命令仅适用于已核实身份的真实接收方，按接收、工作完成的实际阶段分别执行：
+
+```bash
+bash "$S/send.sh" --ack m原消息编号
+bash "$S/send.sh" --complete m原消息编号
+# 可额外列出自己的待处理消息：
+bash "$S/send.sh" --inbox
+```
 
 状态区分为 `recorded`（正文原子落盘）、`notified`（终端通知确认提交）、`received`（目标确认接收）、`completed`（目标声明完成）。正文保存在共享台账目录的 `messages/<编号>.json`。通知失败仍保留正文；重试同编号与原正文，不创建新的重复任务。已确认通知、接收或完成时不再发送通知。通知提交后进程崩溃可能留下 recorded 状态，因此任何重复通知都应按编号处理，不重复执行已接收任务。
 

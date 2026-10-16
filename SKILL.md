@@ -127,17 +127,27 @@ bash "$S/send.sh" demo-backend --durable '请阅读 /private/tmp/task.md，并�
 # 输出消息编号；重试沿用编号及原正文：
 bash "$S/send.sh" demo-backend --durable --id m原消息编号 '请阅读 /private/tmp/task.md，并按其中要求返回验收结果'
 
-# 接收方在自己的真实 cmux 会话中执行：
-bash "$S/send.sh" --inbox
-bash "$S/send.sh" --ack m原消息编号
-# 工作完成且验收证据已按 brief 约定保存后：
-bash "$S/send.sh" --complete m原消息编号
-
-# 发送方查询状态：
+# 收到指定编号的通知后，先只读完整正文与状态；caller=null 也可执行：
 bash "$S/send.sh" --status m原消息编号
+cmux identify
 ```
 
-收到“请查 cmux 收件箱”通知时，先执行 `--inbox` 读取对应编号的完整正文，再 `--ack` 确认接收。不要把通知文本当作完整任务。`--complete` 是接收方显式声明完成，发送方仍需独立验收；该命令不会证明测试已通过。
+收到“请查 cmux 收件箱：<编号>”通知时，先执行 `--status <编号>` 读取完整正文；正文指向 brief 时继续完整读取该文件，不把门铃当作完整任务。`--status` 不调用 cmux、不修改消息状态，可由发送方或外部工具使用。
+
+- `caller` 是记录中的真实目标且 endpoint 仍匹配：读取后 `--ack`，完成并保存约定证据后 `--complete`。`--inbox` 仅用于列出该真实 caller 的待处理消息。
+- `caller=null`：按上述只读方式读取消息，在既定授权范围内处理任务、更新约定的进度与结果文件；不要执行 `--inbox/--ack/--complete`，也不要为消除报错反复重试、取 `focused` 或伪造 `CMUX_SURFACE_ID`。明确记录“协议接收确认不可用”，由协调者直接回读产物；不要求先取得 ACK 才能推进工作。
+- `caller` 属于其他会话或 endpoint 已改变：不要确认接收或冒用目标身份，先核实当前任务归属。
+
+读取正文和业务交付不会自动产生 ACK，也不能据此手改 `received/completed`。`--complete` 是接收方显式声明完成，发送方仍需独立验收；该命令不会证明测试已通过。
+
+以下命令仅适用于已核实身份的真实接收方，按接收、工作完成的实际阶段分别执行：
+
+```bash
+bash "$S/send.sh" --ack m原消息编号
+bash "$S/send.sh" --complete m原消息编号
+# 可额外列出自己的待处理消息：
+bash "$S/send.sh" --inbox
+```
 
 状态区分为 `recorded`（正文原子落盘）、`notified`（终端通知确认提交）、`received`（目标确认接收）、`completed`（目标声明完成）。正文保存在共享台账目录的 `messages/<编号>.json`。通知失败仍保留正文；重试同编号与原正文，不创建新的重复任务。已确认通知、接收或完成时不再发送通知。通知提交后进程崩溃可能留下 recorded 状态，因此任何重复通知都应按编号处理，不重复执行已接收任务。
 

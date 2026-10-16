@@ -42,6 +42,16 @@ def identity():
     return caller.get('surface_ref', '') if caller else ''
 
 
+def receiver_identity(message_id=None):
+    actor = identity()
+    if not actor:
+        message_id = message_id or '<消息编号>'
+        raise ValueError('外部进程没有接收会话身份；请用 send.sh --status ' + message_id
+                         + ' 只读完整正文，按约定更新进度和结果文件；'
+                         + '不能执行 --ack/--complete，也不要用 focused 冒充 caller')
+    return actor
+
+
 def endpoint(ref):
     matches = [row for row in endpoints() if row['ref'] == ref]
     if len(matches) != 1:
@@ -147,13 +157,12 @@ def main():
     elif command == 'enqueue':
         print(enqueue(*values))
     elif command in ('notified', 'ack', 'complete'):
-        transition(values[0], {'notified': 'notified', 'ack': 'received', 'complete': 'completed'}[command], identity())
+        actor = identity() if command == 'notified' else receiver_identity(values[0])
+        transition(values[0], {'notified': 'notified', 'ack': 'received', 'complete': 'completed'}[command], actor)
     elif command == 'status':
         print(message_path(values[0]).read_text())
     elif command == 'inbox':
-        actor = identity()
-        if not actor:
-            raise ValueError('外部进程没有接收会话身份')
+        actor = receiver_identity()
         key = endpoint(actor)
         for path in sorted((ROOT / 'messages').glob('*.json')):
             data = json.loads(path.read_text())

@@ -19,6 +19,10 @@
 #   send.sh <目标> --flush '<消息开头几个字>'  目标空闲后,补交卡在它输入框里的消息
 #   send.sh <目标> --peek                    探测目标输入框:空 / 真卡箱 / ghost text
 #   send.sh --list                          列出所有可寻址会话
+#   send.sh --status <消息编号>             只读完整消息与状态，不要求 caller
+#   send.sh --inbox                         列出真实 caller 的待处理消息
+#   send.sh --ack <消息编号>                真实目标会话确认接收
+#   send.sh --complete <消息编号>           真实目标会话声明完成
 #   (台账查询/手动消账见同目录 pending.sh)
 #
 # <目标> 可以是:注册表别名 | tab 标题(精确)| 标题子串(唯一时)| surface:N
