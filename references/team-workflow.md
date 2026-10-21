@@ -137,7 +137,7 @@ bash "$S/send.sh" --status "$FIRST_EVENT_ID"
 
 事件 `delivered=true` 及信箱 `notified/received/completed` 证明通知已确认提交，仍不能证明接收方已验收任务。首次通知失败且尚未重试成功时不声称唤醒路由已经验证；协调者仍按登记任务直接回读进度和产物，执行方按下面的后台移交规则处理通知。协调会话收到门铃后必须读取自己的信箱与对应状态文件，按 task_id 恢复任务，不把门铃视作最终结论。普通 running、每轮检查及恢复 running 只写状态，不发通知。重要事件 completion_reported、blocked、approval_required、stalled、idle_unfinished、session_changed、timed_out、unknown、delivery_invalid、blocked_cleared 才通过 `send.sh --durable` 发短状态指针；对相同事件去重，失败保留队列并按原编号重试。相同状态文件持有互斥锁，避免重复监听。
 
-新通知前缀显示“监听器 / 被监控对象”，来源标签与目标标签随事件落盘；项目主动消息继续使用 send.sh 的项目来源前缀，人工读 UI 即可区分。监听器通过 CMUX_FROM_LABEL 提供展示标签，CMUX_FROM 仍保存原发送身份；项目主动通知不设置该展示变量。来源标签只是展示，不赋予 ACK 身份。旧事件沿用原 sender 显示来源，包括 codex-external；不改原信箱编号、正文或 sender。普通事件含旧 pending running 标记 suppressed，delivered 仍为 false，不再重试也不拖住终止宽限。通知事件在落盘时固定 sender；重启后即使 `CMUX_FROM` 改变，同一事件仍沿用原 sender、编号和正文。旧事件缺少 sender 时从原信箱消息记录恢复，不改写已落盘消息的身份。
+新通知前缀显示“监听器 / 被监控对象”，来源标签与目标标签随事件落盘；项目主动消息使用实际来源会话的标题，有真实 caller 时默认由 send.sh 自动生成，不按任务角色拼接 `-be` / `-fe`。外部进程按 SKILL.md 的来源核实规则使用实际会话名，例如已明确来源 `aimeter` 就显示 `(from aimeter)`；外部工具进程信息写入 brief。`caller=null` 不直接导致来源未知，仅在来源依据缺失或歧义无法消除时声明“来源未识别（外部进程）”。监听器通过 CMUX_FROM_LABEL 提供展示标签，CMUX_FROM 仍保存原发送身份；项目主动通知不设置该展示变量。来源标签只是展示，不赋予 ACK 身份。旧事件沿用原 sender 显示来源，包括 codex-external；不改原信箱编号、正文或 sender。普通事件含旧 pending running 标记 suppressed，delivered 仍为 false，不再重试也不拖住终止宽限。通知事件在落盘时固定 sender；重启后即使 `CMUX_FROM` 改变，同一事件仍沿用原 sender、编号和正文。旧事件缺少 sender 时从原信箱消息记录恢复，不改写已落盘消息的身份。
 
 旧告警失效要有明确依据：后续 stalled_cleared 可 supersede 之前未送达的 stalled；后续 blocked 内容变化、blocked_cleared 或 completion_reported 可取代之前未送达的 blocked。事件保留原 id/body/sender，写 suppressed=true、superseded=true、superseded_by及 suppressed_reason，delivered仍为false；原信箱文件不改写，输入框中的旧门铃不清空。已 delivered 的历史不修改；权限、身份变化、交付与到期通知不因普通恢复被抑制。尚未恢复的新一轮 stalled 仍保留。
 

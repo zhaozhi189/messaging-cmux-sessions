@@ -22,6 +22,10 @@ bash "$S/pending.sh" list
 
 发送前现查会话。优先注册表别名或明确的 `surface:N`，标题必须唯一。不得根据旧编号、默认目录标题猜目标。当前调用方通过 `cmux identify` 定位。
 
+消息的 `from` 使用实际来源会话名，不能按任务角色或仓库名猜测、拼接 `-be` / `-fe`。有真实 caller 时，按 `caller.surface_ref` 查询当前会话标题，默认让 send.sh 自动生成来源，不设置 `CMUX_FROM` 覆盖它。标题缺失时使用已确认的 surface 编号；`focused` 不是来源身份。
+
+`caller=null` 仅表示工具进程没有 cmux 接收确认身份，不等于来源名称未知。来源展示与 ACK 身份分别判断；先核实来源上下文，再决定是否使用“来源未识别”，不能仅凭 caller 为空就降级。
+
 注册表默认沿用 `~/.claude/cmux-sessions.conf`，台账沿用 `~/.claude/cmux-messaging`，这是为了与现有 Claude 会话共享数据；可分别通过 `CMUX_SESSIONS_CONF`、`CMUX_MSG_DIR` 覆盖。所有协作会话必须使用同一份注册表和台账。没有注册表也可按 surface 或唯一标题寻址。
 
 ## 派活与验收
@@ -112,7 +116,15 @@ python3 "$S/delivery-wait.py" --id "$MESSAGE_ID" \
 
 cmux 的 `automation.socketControlMode` 应设为 `automation`，允许同一 macOS 用户的外部进程访问本机 socket。该授权与 Codex 脚本审批规则分别生效。访问失败时 `send.sh --list` 返回非零并保留原始错误，不把失败报告成没有会话。
 
-外部进程没有 cmux 来源 surface，不要伪造 `CMUX_SURFACE_ID`。普通发送可设置 `CMUX_FROM=codex-external` 标明来源；需要 `--ask` 时同样设置来源名，并在 brief 中指定回复文件。若有真实的回复接收会话，可设置 `CMUX_REPLY_TO=surface:N`；该编号必须现查。没有真实接收会话时由外部调用方前台读取回复文件；任务监听的 `--notify` 可显式指定已验证的真实接收会话，不使用隐式 watcher 自唤醒。
+外部进程没有 cmux caller，不要伪造 `CMUX_SURFACE_ID`。按以下依据核实来源：
+
+- 用户明确说明实际来源，或当前会话的启动上下文、任务交接已绑定来源会话：现查实际标题与 surface，使用该会话名。
+- 尚无明确绑定：核对当前仓库的真实路径、注册表中的仓库到会话映射及现场唯一匹配的会话标题。三者一致可作为来源依据；无注册表时可使用已有任务交接中的明确映射。不能只因目录名相似或正在做前端、后端任务就补出一个名称。
+- 上述依据仍缺失、冲突或存在多个候选：才设置 `CMUX_FROM='来源未识别（外部进程）'`，在 brief 中写明缺少的来源证据。`focused` 或同名 tab 存在不能单独证明来源。
+
+来源已核实时设置 `CMUX_FROM` 为实际会话名，例如用户明确指出来源是 `aimeter`，就使用 `CMUX_FROM=aimeter`，显示 `(from aimeter)`；不改成 `aimeter-be`，也不因 `caller=null` 改成“来源未识别”。仅在同名会话需要区分时追加已确认的 surface。外部工具进程、来源核实依据及回复路径写进 brief，不强制塞进来源名称。发送前核对已绑定的 endpoint，发现漂移先重新核实归属。
+
+`CMUX_FROM` 是发送方声明的展示标签，不会赋予 caller 或 ACK 身份。需要 `--ask` 时在 brief 中指定回复文件；若有真实的回复接收会话，可设置 `CMUX_REPLY_TO=surface:N`，该编号必须现查。没有真实接收会话时由外部调用方前台读取回复文件；任务监听的 `--notify` 可显式指定已验证的真实接收会话，不使用隐式 watcher 自唤醒。重试旧消息仍沿用原 sender，不因本规则改写历史记录。
 
 修改 socket 模式后执行 `cmux reload-config` 并用外部进程实际测试；若运行实例仍拒绝连接，需从 Automation 设置应用模式，或安排重启 cmux，不能把配置已写入当成已生效。
 
