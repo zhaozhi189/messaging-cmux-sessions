@@ -119,6 +119,8 @@ DISPATCH_TS=$(date +%s)
 
 `updated_at` 是 Unix 秒；`status` 仅为 `running/blocked/completed`。在接收、实质进展、阻塞和交付时更新。`completed` 必须附存在的绝对路径产物；仅提交号、屏幕文字、文件 mtime 或 HEAD 移动不足以证明任务完成。`blocked` 写明需要谁处理及原因。业务未决项保留在产物里，不伪装已经批准。
 
+若长任务需要定期写入存活心跳，可仅刷新 `updated_at`；监听器仍按上次实际内容变化计算无进展时间，不解除已有 `stalled`，也不抑制尚未解决的停滞通知。只有状态、摘要、产物或其他业务内容变化才更新进展基线。旧监听状态的签名迁移保留原进展时间。
+
 需要交付的每个子任务默认一个监听。以下变量均来自本轮已核实的 brief；路径避免复用昨天任务的文件：
 
 ```bash
@@ -148,6 +150,10 @@ bash "$S/send.sh" --status "$FIRST_EVENT_ID"
 事件 `delivered=true` 及信箱 `notified/received/completed` 证明通知已确认提交，仍不能证明接收方已验收任务。首次通知失败且尚未重试成功时不声称唤醒路由已经验证；协调者仍按登记任务直接回读进度和产物，执行方按下面的后台移交规则处理通知。协调会话收到门铃后必须读取自己的信箱与对应状态文件，按 task_id 恢复任务，不把门铃视作最终结论。普通 running、每轮检查及恢复 running 只写状态，不发通知。重要事件 completion_reported、blocked、approval_required、stalled、idle_unfinished、session_changed、timed_out、unknown、delivery_invalid、blocked_cleared 才通过 `send.sh --durable` 发短状态指针；对相同事件去重，失败保留队列并按原编号重试。相同状态文件持有互斥锁，避免重复监听。
 
 新通知前缀显示“监听器 / 被监控对象”，来源标签与目标标签随事件落盘；项目主动消息使用实际来源会话的标题，有真实 caller 时默认由 send.sh 自动生成，不按任务角色拼接 `-be` / `-fe`。外部进程按 SKILL.md 的来源核实规则使用实际会话名，例如已明确来源 `aimeter` 就显示 `(from aimeter)`；外部工具进程信息写入 brief。`caller=null` 不直接导致来源未知，仅在来源依据缺失或歧义无法消除时声明“来源未识别（外部进程）”。监听器通过 CMUX_FROM_LABEL 提供展示标签，CMUX_FROM 仍保存原发送身份；项目主动通知不设置该展示变量。来源标签只是展示，不赋予 ACK 身份。旧事件沿用原 sender 显示来源，包括 codex-external；不改原信箱编号、正文或 sender。普通事件含旧 pending running 标记 suppressed，delivered 仍为 false，不再重试也不拖住终止宽限。通知事件在落盘时固定 sender；重启后即使 `CMUX_FROM` 改变，同一事件仍沿用原 sender、编号和正文。旧事件缺少 sender 时从原信箱消息记录恢复，不改写已落盘消息的身份。
+
+新监听事件首次建立时解析实际来源并写入状态；同一监听后续事件沿用该来源。监听器发送固定事件时使用 `SEND_SELF_OK=1` 和“监听器 / 被监控对象”展示标签，兼容既有事件尚未落盘及 caller 已变化的重试。普通项目消息不得借用该监听器展示方式绕过来源冲突检查。
+
+来源查询暂时失败时，在监听状态的 `source_error` 中记录原因，该事件使用未识别来源，任务观察继续。查询恢复后重新核实新事件的来源，旧事件的 sender 和展示标签保持不变。
 
 旧告警失效要有明确依据：后续 stalled_cleared 可 supersede 之前未送达的 stalled；后续 blocked 内容变化、blocked_cleared 或 completion_reported 可取代之前未送达的 blocked。事件保留原 id/body/sender，写 suppressed=true、superseded=true、superseded_by及 suppressed_reason，delivered仍为false；原信箱文件不改写，输入框中的旧门铃不清空。已 delivered 的历史不修改；权限、身份变化、交付与到期通知不因普通恢复被抑制。尚未恢复的新一轮 stalled 仍保留。
 
@@ -181,7 +187,9 @@ kill -0 "$DELIVERY_PID"
 
 读取首轮状态和日志，核对message_id、target、endpoint、sender、body_hash与原消息，PID必须匹配本次进程；deadline_at必须是本轮期限。进程若已正常退出则核对exit_code和原信箱状态，不要求已退出进程仍存活。只有PID存在而状态未落盘、锁冲突退出4、路径/身份校验失败或异常退出都不能宣称托管成功。将原消息编号、状态/日志/PID文件、期限写入交付产物的“通知观察”段：交付已完成、传输状态、协调观察负责人、未决项。执行方随后结束当前执行回合、恢复接收后续派单，不把业务进度改回blocked来等通知。确实无法后台启动时保留结果和未投递记录，明确缺失条件；协调者承担回读与重试责任，不转给用户。
 
-协调者每轮核对后台PID及状态；exit_code=5是到期未送达，6是路由漂移，异常退出需要日志诊断，均不等于验收或收到通知。未决且仍有效的原任务可核实后沿原编号显式resume，不能盲目无限续挂。业务已独立验收或被后续任务取代时，由等待进程所有者核对PID完整命令后用SIGINT停止不再必要的观察并确认退出（delivery-wait会清理正在发送的子进程组），另存取消理由、原消息编号、task_id及验收/取代证据；不改原信箱state或delivered，不把业务accepted/review文件当transport ACK。停止等待不会清掉终端里已有文字。
+协调者每轮核对后台PID及状态；exit_code=5是到期未送达，6是路由漂移，130且status=stopped表示等待被中断，均不等于验收或收到通知。未决且仍有效的原任务可核实后沿原编号显式resume，不能盲目无限续挂。收到其它业务回复、对方已回读产物或自己完成交付，都不能直接作为取消本条通知的依据。有效协作任务的门铃已经留在目标输入框时，继续保留原编号的安全投递观察，避免空闲后门铃无人补交。
+
+用户暂停/取消、任务已终止或本条通知被明确作废时，才停止不再需要的观察。停止前只读核对输入框和原记录；由等待进程所有者核对PID完整命令后用SIGINT停止并确认退出（delivery-wait会清理正在发送的子进程组）。另存取消理由、原消息编号、task_id及作废证据，并在记录和交付说明中明确是否遗留门铃及后续负责人。停止后状态记录stopped、stopped_at和exit_code=130；恢复须核实后显式--resume。不改原信箱state或delivered，不把业务accepted/review文件当transport ACK。停止等待不会清掉终端里已有文字；不得用清空输入、替别人补交或伪造送达来收尾。
 
 若协调输入框被旧门铃占住，新的消息等待foreign_input是安全行为。协调者先按既有任务路径读产物并推进验收、派单；旧门铃只有记录目标的真实caller且endpoint仍匹配时才能读取完整正文后显式ack。外部进程只可status和读文件，不能冒caller或借accepted伪造received/notified。只有该旧编号自己的安全重试能在空闲且精确匹配完整门铃时补交；其它发送方不能清空、补交或按Tab。折行、陌生草稿、权限框、忙碌和身份漂移继续拒绝输入。无需建立新的receipt协议。
 

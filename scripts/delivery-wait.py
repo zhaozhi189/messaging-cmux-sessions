@@ -18,9 +18,11 @@ import protocol
 watch = importlib.import_module('task-watch')
 FINAL = ('notified', 'received', 'completed')
 FOOTER = (r'\s*(?:[─━═]+|\? for shortcuts|\d+% context left.*|'
-          r'GPT-\S+ (?:default|minimal|low|medium|high|xhigh|max|ultra) · [^\n]+ · '
-          r'Context \d+% used · weekly \d+% left · \d+\.\d+\.\d+(?: · Main \[default\])?|'
-          r'⚠ \d+ warnings? · f2 to view|tab to queue message|← for agents · \? for shortcuts(?: ⚠ \d+ warnings?)? · f2 to view)\s*')
+          r'GPT-\S+ (?:default|minimal|low|medium|high|xhigh|max|ultra)(?: fast)? · [^\n]+ · '
+          r'Context \d+% used · weekly \d+% left · \d+\.\d+\.\d+'
+          r'(?: · \d+[KM] window)?(?: · Main \[default\])?|'
+          r'⚠ \d+ warnings? · f2 to view|tab to queue message|'
+          r'← for agents · \? for shortcuts(?:\s+⚠ \d+ warnings? · f2 to view| · f2 to view)?)\s*')
 PLACEHOLDERS = ('', 'Ask Codex to do anything', 'Implement {feature}',
                 'Find and fix a bug in @filename', 'Write tests for @filename',
                 'Summarize recent commits', 'Improve documentation in @filename',
@@ -174,51 +176,68 @@ def main():
             print('已有进程监听此消息编号', file=sys.stderr)
             return 4
         state = load_state(args, data)
-        # 每轮需重新观察实时输入，不能批量替代；默认本轮上限 1800 秒，单次等待最多 60 秒。
-        while True:
-            data = message(args.id)
-            if identity(data) != {k: state[k] for k in identity(data)}:
-                raise ValueError('原信箱消息身份已改变，停止旧任务')
-            state.update(checked_at=time.time(), pid=os.getpid(), timeout=args.timeout,
-                         deadline_at=state['started_at'] + args.timeout, exit_code=None)
-            if data['state'] in FINAL:
-                status = data['state']
-            elif state.get('status') == 'timed_out' or time.time() - state['started_at'] >= args.timeout:
-                status = 'timed_out'
-            else:
-                try:
+        try:
+            return wait_for_delivery(args, state)
+        except KeyboardInterrupt:
+            state.update(status='stopped', stopped_at=time.time(), exit_code=130,
+                         delivered=message(args.id)['state'] in FINAL,
+                         error='投递等待已停止，终端可能仍有原门铃；须核对原消息和输入框，恢复需显式 --resume')
+            protocol.atomic(args.state, state)
+            print(state['error'], file=sys.stderr)
+            return 130
+
+
+def wait_for_delivery(args, state):
+    # 每轮需重新观察实时输入，不能批量替代；默认本轮上限 1800 秒，单次等待最多 60 秒。
+    while True:
+        data = message(args.id)
+        if identity(data) != {k: state[k] for k in identity(data)}:
+            raise ValueError('原信箱消息身份已改变，停止旧任务')
+        state.update(checked_at=time.time(), pid=os.getpid(), timeout=args.timeout,
+                     deadline_at=state['started_at'] + args.timeout, exit_code=None)
+        if data['state'] in FINAL:
+            status = data['state']
+        elif state.get('status') == 'stopped':
+            status = 'stopped'
+        elif state.get('status') == 'timed_out' or time.time() - state['started_at'] >= args.timeout:
+            status = 'timed_out'
+        else:
+            try:
+                status = probe(data, args.target)
+                if status in ('empty', 'owned'):
+                    state['attempts'] += 1
+                    protocol.atomic(args.state, state)
+                    run_send(data, state)
+                    data = message(args.id)
                     status = probe(data, args.target)
                     if status in ('empty', 'owned'):
-                        state['attempts'] += 1
-                        protocol.atomic(args.state, state)
-                        run_send(data, state)
-                        data = message(args.id)
-                        status = probe(data, args.target)
-                        if status in ('empty', 'owned'):
-                            status = 'unconfirmed'
-                except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
-                    status = 'unknown'
-                    state['error'] = str(exc)
-            if status not in ('unknown', 'timed_out', 'session_changed'):
-                state.pop('error', None)
-            state.update(status=status, delivered=status in FINAL)
-            if status == 'timed_out':
-                state['error'] = '本轮等待到期，未送达；核实原任务及endpoint后用原参数 --resume 续挂，不把超时当完成'
-            elif status == 'session_changed':
-                state['error'] = '目标endpoint已改变，停止旧路由；需重新现查并决定任务归属，禁止盲目续挂'
-            state['exit_code'] = (0 if status in FINAL else 6 if status == 'session_changed'
-                                  else 5 if status == 'timed_out' else 2 if args.once else None)
-            protocol.atomic(args.state, state)
-            print(json.dumps(dict(message_id=args.id, status=status, state=str(args.state)), ensure_ascii=False), flush=True)
-            if status in FINAL:
-                return 0
-            if status == 'session_changed':
-                return 6
-            if status == 'timed_out':
-                return 5
-            if args.once:
-                return 2
-            time.sleep(min(args.interval, max(.01, args.timeout - (time.time() - state['started_at']))))
+                        status = 'unconfirmed'
+            except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
+                status = 'unknown'
+                state['error'] = str(exc)
+        if status not in ('unknown', 'timed_out', 'session_changed', 'stopped'):
+            state.pop('error', None)
+        state.update(status=status, delivered=status in FINAL)
+        if status == 'timed_out':
+            state['error'] = '本轮等待到期，未送达；核实原任务及endpoint后用原参数 --resume 续挂，不把超时当完成'
+        elif status == 'session_changed':
+            state['error'] = '目标endpoint已改变，停止旧路由；需重新现查并决定任务归属，禁止盲目续挂'
+        state['exit_code'] = (0 if status in FINAL else 6 if status == 'session_changed'
+                              else 5 if status == 'timed_out' else 130 if status == 'stopped'
+                              else 2 if args.once else None)
+        protocol.atomic(args.state, state)
+        print(json.dumps(dict(message_id=args.id, status=status, state=str(args.state)), ensure_ascii=False), flush=True)
+        if status in FINAL:
+            return 0
+        if status == 'session_changed':
+            return 6
+        if status == 'timed_out':
+            return 5
+        if status == 'stopped':
+            return 130
+        if args.once:
+            return 2
+        time.sleep(min(args.interval, max(.01, args.timeout - (time.time() - state['started_at']))))
 
 
 if __name__ == '__main__':

@@ -20,6 +20,13 @@ import uuid
 import protocol
 
 
+PROGRESS_SIGNATURE_VERSION = 2
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 def positive(value):
     number = float(value)
     if not math.isfinite(number) or number <= 0:
@@ -188,10 +195,18 @@ def pending_events(state):
 
 def add_event(state, kind, args, now):
     identifier = 'm' + uuid.uuid4().hex
-    sender = state.setdefault('notify_sender', os.environ.get('CMUX_FROM') or 'codex-external')
+    if 'notify_sender' not in state or state.get('source_error'):
+        try:
+            state['notify_sender'] = protocol.sender()
+            state.pop('source_error', None)
+        except protocol.CommandError:
+            raise
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError) as exc:
+            state.update(notify_sender=protocol.UNKNOWN_SOURCE, source_error=str(exc))
+    sender = state['notify_sender']
     state['events'].append(dict(id=identifier, type=kind, created_at=now, delivered=False, attempts=0,
                                sender=sender, target_label=state.get('target_label', args.target),
-                               source_label='监听器 / ' + state.get('target_label', args.target),
+                               source_label=protocol.MONITOR_PREFIX + state.get('target_label', args.target),
                                suppressed=kind not in IMPORTANT_EVENTS,
                                body=f'[task-watch] {args.task_id} {kind}；请检查 {args.state}'))
 
@@ -288,15 +303,20 @@ def tick(args, state):
             state['notify'] = args.notify
         result, reason = read_result(args, state)
         if result is not None:
-            signature = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            if signature != state.get('progress_signature'):
-                state.update(last_progress_at=now, progress_signature=signature)
+            content = {key: value for key, value in result.items() if key != 'updated_at'}
+            signature = fingerprint(content)
+            previous_signature = state.get('progress_signature')
+            if previous_signature and state.get('progress_signature_version') != PROGRESS_SIGNATURE_VERSION:
+                previous_result = dict(result, updated_at=state.get('result_updated_at'))
+                if fingerprint(previous_result) == previous_signature:
+                    previous_signature = signature
+            if signature != previous_signature:
+                state['last_progress_at'] = now
+            state.update(progress_signature=signature, progress_signature_version=PROGRESS_SIGNATURE_VERSION)
             state.update(result_updated_at=result['updated_at'], summary=result.get('summary', ''),
                          artifacts=result.get('artifacts', []))
         if result is not None:
             if result['status'] == 'blocked':
-                content = {key: value for key, value in result.items() if key != 'updated_at'}
-                signature = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
                 blocked_changed = (signature != previous_blocked_signature if previous_blocked_signature else
                                    previous_blocked_content != (result.get('summary', ''), result.get('artifacts', [])))
                 state.update(blocked_active=True, blocked_signature=signature)

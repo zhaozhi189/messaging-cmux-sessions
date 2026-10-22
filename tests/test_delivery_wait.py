@@ -2,6 +2,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -134,6 +135,36 @@ elif cmd=='send':
         self.assertEqual(self.run_wait(expected=2)['status'], 'foreign_input')
         self.assertEqual(len(self.sends()), 2)
 
+    def test_fast_window_footer_only_flushes_owned_notice_when_idle(self):
+        footer = ('\n  GPT-6.1-Sol high fast · demo-project · main · Context 38% used · weekly 49% left · 0.163.0 · 475K window'
+                  '\n  ← for agents · ? for shortcuts                                                                                   ⚠ 4 warnings · f2 to view')
+        notice = '(from original-sender) 请查 cmux 收件箱：mdelivery'
+        for prefix, suffix, expected in [
+                ('• Working (1m • esc to interrupt)\n', '', 'busy'),
+                ('Do you want to proceed?\n1. Yes\n2. No\n', '', 'approval_required'),
+                ('', '\n  用户草稿续行', 'foreign_input'),
+                ('', '\n  未识别的界面文字', 'foreign_input')]:
+            with self.subTest(expected=expected, suffix=suffix):
+                self.options['screen'] = prefix + '› ' + notice + footer + suffix
+                self.assertEqual(self.run_wait(expected=2)['status'], expected)
+                self.assertEqual(self.sends(), [])
+        self.options['screen'] = '› ' + notice + footer
+        self.assertEqual(self.run_wait()['status'], 'notified')
+        self.assertEqual([a[-1] for a in self.sends()], ['\\r'])
+
+    def test_window_footer_accepts_placeholder_without_warning(self):
+        self.options['screen'] = ('› Ask Codex to do anything'
+            '\n  GPT-6.1-Sol high · demo-project · main · Context 38% used · weekly 49% left · 0.163.0 · 475K window · Main [default]'
+            '\n  ← for agents · ? for shortcuts')
+        self.assertEqual(self.run_wait()['status'], 'notified')
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_unknown_status_suffix_remains_foreign_input(self):
+        self.options['screen'] = ('› (from original-sender) 请查 cmux 收件箱：mdelivery'
+            '\n  GPT-6.1-Sol high fast · demo-project · main · Context 38% used · weekly 49% left · 0.163.0 · 475K window 用户草稿')
+        self.assertEqual(self.run_wait(expected=2)['status'], 'foreign_input')
+        self.assertEqual(self.sends(), [])
+
     def test_main_default_queue_footer_keeps_busy_and_draft_protection(self):
         footer = ('\n  GPT-6.1-Sol medium · demo-project · main · Context 39% used · weekly 80% left · 0.162.0 · Main [default]'
                   '\n  tab to queue message')
@@ -206,6 +237,38 @@ elif cmd=='send':
                                     env=self.env, capture_output=True)
             self.assertEqual(result.returncode, 4)
         self.assertEqual(self.sends(), [])
+
+    def test_sigint_records_stopped_state_and_requires_explicit_resume(self):
+        self.options['screen'] = '• Working (1m • esc to interrupt)\n› (from original-sender) 请查 cmux 收件箱：mdelivery'
+        self.config.write_text(json.dumps(self.options))
+        original = self.record.read_bytes()
+        process = subprocess.Popen([sys.executable, str(SCRIPT), '--id', 'mdelivery',
+            '--state', str(self.state), '--interval', '30'], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not self.state.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(self.state.exists(), '监听未生成首轮状态')
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 130, stdout + stderr)
+            state = json.loads(self.state.read_text())
+            self.assertEqual(state['status'], 'stopped')
+            self.assertEqual(state['exit_code'], 130)
+            self.assertFalse(state['delivered'])
+            self.assertGreaterEqual(state['stopped_at'], state['checked_at'])
+            self.assertEqual(self.record.read_bytes(), original)
+            self.assertEqual(self.sends(), [])
+            self.options['screen'] = '› (from original-sender) 请查 cmux 收件箱：mdelivery'
+            self.assertEqual(self.run_wait(expected=130)['status'], 'stopped')
+            self.assertEqual(self.sends(), [])
+            self.assertEqual(self.run_wait('--resume')['status'], 'notified')
+            self.assertEqual([a[-1] for a in self.sends()], ['\\r'])
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
 
     def test_missing_agent_is_unknown_and_wait_interval_is_bounded(self):
         self.options['screen']='user@host % '

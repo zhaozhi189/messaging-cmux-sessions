@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,8 @@ with (p / 'calls.jsonl').open('a') as f: f.write(json.dumps(args) + '\\n')
 if command == 'tree':
  print(json.dumps({'windows':[{'ref':'window:1','workspaces':[{'id':c['generation'],'title':'group','panes':[{'surfaces':[{'ref':'surface:1','title':'receiver','type':'terminal','tty':'t1'},{'ref':'surface:2','title':'worker','type':'terminal','tty':'t2'}]}]}]}]}))
 elif command == 'identify':
+ if c.get('identity_fail'):
+  print('identify unavailable', file=sys.stderr); sys.exit(1)
  print(json.dumps({'caller': {'surface_ref':c['caller']} if c.get('caller') else None, 'focused': {'surface_ref':'surface:2'}}))
 elif command == 'read-screen':
  if c.get('screen_fail'): sys.exit(1)
@@ -196,6 +199,29 @@ elif command == 'send':
         self.assertTrue(any('(from 监听器 / worker)' in text for text in texts))
         self.assertEqual(state['events'][0]['id'], event['id'])
 
+    def test_new_monitor_event_captures_real_caller_source(self):
+        self.options.update(caller='surface:1', screen='Do you want to proceed?\n1. Yes\n2. No')
+        self.env.pop('CMUX_FROM', None)
+        state = self.run_tick('--notify', 'surface:1')
+        event = state['events'][0]
+        self.assertEqual(event['sender'], 'receiver')
+        self.assertEqual(event['source_label'], '监听器 / worker')
+        self.assertTrue(event['delivered'])
+
+    def test_source_lookup_failure_does_not_stop_observation(self):
+        self.options.update(identity_fail=True, screen='Working (esc to interrupt)\n› ')
+        self.progress()
+        state = self.run_tick()
+        self.assertEqual(state['status'], 'running')
+        self.assertFalse(state['stopped'])
+        self.assertTrue(state['source_error'])
+        self.assertEqual(state['events'][0]['sender'], '来源未识别（外部进程）')
+        self.options.update(identity_fail=False, caller='surface:1', screen='Do you want to proceed?\n1. Yes\n2. No')
+        state = self.run_tick()
+        self.assertNotIn('source_error', state)
+        self.assertEqual(state['events'][-1]['sender'], 'receiver')
+        self.assertEqual(state['events'][0]['sender'], '来源未识别（外部进程）')
+
     def test_legacy_generic_source_is_visible_without_rewriting_record(self):
         self.options.update(screen='Do you want to proceed?\n1. Yes\n2. No', send_fail=True)
         self.env['CMUX_FROM'] = 'codex-external'
@@ -339,6 +365,41 @@ elif command == 'send':
         state = self.run_tick('--stale-after', '30')
         self.assertFalse(state['stalled'])
         self.assertIn('stalled_cleared', [event['type'] for event in state['events']])
+
+    def test_timestamp_only_heartbeat_does_not_clear_stalled(self):
+        self.options['screen'] = 'Working (esc to interrupt)\n› '
+        self.progress()
+        self.run_tick()
+        state = json.loads(self.state.read_text())
+        previous_progress = time.time() - 100
+        state['last_progress_at'] = previous_progress
+        self.state.write_text(json.dumps(state))
+        self.assertTrue(self.run_tick('--stale-after', '30')['stalled'])
+        self.progress()
+        state = self.run_tick('--stale-after', '30')
+        self.assertTrue(state['stalled'])
+        self.assertEqual(state['last_progress_at'], previous_progress)
+        self.assertNotIn('stalled_cleared', [event['type'] for event in state['events']])
+        self.progress(summary='新产物已生成')
+        state = self.run_tick('--stale-after', '30')
+        self.assertFalse(state['stalled'])
+        self.assertIn('stalled_cleared', [event['type'] for event in state['events']])
+
+    def test_legacy_signature_migrates_without_heartbeat_progress(self):
+        self.options['screen'] = 'Working (esc to interrupt)\n› '
+        self.progress()
+        self.run_tick()
+        state = json.loads(self.state.read_text())
+        result = json.loads(self.result.read_text())
+        state['progress_signature'] = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        state.pop('progress_signature_version', None)
+        previous_progress = time.time() - 100
+        state['last_progress_at'] = previous_progress
+        self.state.write_text(json.dumps(state))
+        self.progress()
+        state = self.run_tick('--stale-after', '30')
+        self.assertTrue(state['stalled'])
+        self.assertEqual(state['last_progress_at'], previous_progress)
 
     def test_recovered_stalled_notice_is_superseded_without_record_rewrite(self):
         self.options.update(screen='Working (esc to interrupt)\n› ', send_fail=True)

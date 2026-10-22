@@ -56,62 +56,20 @@ MSGDIR="${CMUX_MSG_DIR:-$HOME/.claude/cmux-messaging}"
 
 die() { echo "$@" >&2; exit 4; }
 
-# ── 会话清单:ref|window|workspace|title,一次拿全(含未选中的 workspace)────────
 list_surfaces() {
-  python3 "$SCRIPT_DIR/protocol.py" list || {
+  local rows
+  rows=$(python3 "$SCRIPT_DIR/protocol.py" list) || {
     echo "✗ 无法连接或发现 cmux 会话；连接或结构错误不等于没有目标。" >&2
     return 6
   }
+  [ -z "$rows" ] || printf '%s\n' "$rows"
 }
 
-# ── 注册表:把别名翻译成 tab 标题(可选,文件不存在就跳过)──────────────────────
-# 格式(| 分隔,# 开头为注释):  别名 | tab标题 | 仓库路径 | 分组 | 说明
-registry_lookup() {
-  [ -f "$REGISTRY" ] || return 1
-  LC_ALL=C awk -F'|' -v key="$1" '
-    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
-    /^[ \t]*#/ || /^[ \t]*$/ { next }
-    trim($1) == key { print trim($2); found = 1; exit }
-    END { exit !found }
-  ' "$REGISTRY"
-}
-
-# ── 定位目标:别名 → surface:N → 标题精确 → 标题子串(唯一才算)────────────────
 resolve() {
-  local want="$1" alias_tab rows
-  alias_tab=$(registry_lookup "$want" 2>/dev/null) && [ -n "$alias_tab" ] && want="$alias_tab"
-
-  rows=$(list_surfaces)
-  [ -n "$rows" ] || die "✗ cmux 没有返回任何会话(cmux 在运行吗?)"
-
-  local hit
-  if printf '%s' "$want" | grep -qE '^surface:[0-9]+$'; then
-    hit=$(printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v r="$want" '$1 == r')
-  else
-    hit=$(printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v t="$want" '$4 == t')
-    [ -z "$hit" ] && hit=$(printf '%s\n' "$rows" | LC_ALL=C awk -F'|' -v t="$want" 'index($4, t) > 0')
-  fi
-
-  [ -z "$hit" ] && { echo "✗ 未找到会话: $want" >&2; echo "   可用会话:" >&2
-                     printf '%s\n' "$rows" | awk -F'|' '{printf "     %-12s\t%s\t%s\n", $1, $3, $4}' >&2
-                     exit 1; }
-
-  # 重名/多命中绝不静默取第一个 —— 发错会话比发不出去更糟。
-  if [ "$(printf '%s\n' "$hit" | wc -l | tr -d ' ')" -gt 1 ]; then
-    echo "✗ 目标不唯一: $want —— 请用 surface:N 或更精确的标题" >&2
-    printf '%s\n' "$hit" | awk -F'|' '{printf "     %-12s\t%s\t%s\n", $1, $3, $4}' >&2
-    exit 4
-  fi
-  printf '%s' "$hit"
+  python3 "$SCRIPT_DIR/protocol.py" resolve "$1" "$REGISTRY"
 }
 
-# 本会话身份(用于来源前缀 + 防自发自收)
 self_ref() { python3 "$SCRIPT_DIR/protocol.py" self; }
-self_title() {
-  local me; me=$(self_ref) || return 1
-  [ -n "$me" ] || return 1
-  list_surfaces | awk -F'|' -v r="$me" '$1 == r { print ($4 != "" ? $4 : r); exit }'
-}
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 [ $# -ge 1 ] || die "用法: send.sh <目标> <消息> | send.sh <目标> --flush '<签名>' | send.sh --list"
@@ -124,8 +82,11 @@ case "$1" in
 esac
 
 if [ "$1" = "--list" ]; then
+  rows=$(list_surfaces) || exit $?
   printf 'SURFACE\tWORKSPACE\tWINDOW\tTITLE\n'
-  list_surfaces | awk -F'|' '{printf "%s\t%s\t%s\t%s\n", $1, $3, $2, $4}'
+  if [ -n "$rows" ]; then
+    printf '%s\n' "$rows" | awk -F'|' '{printf "%s\t%s\t%s\t%s\n", $1, $3, $2, $4}'
+  fi
   exit 0
 fi
 
@@ -152,10 +113,10 @@ done
 [ "$RETRY" = 0 ] || { [ "$DURABLE" = 1 ] && [ -n "$MESSAGE_ID" ]; } || die "--retry 仅用于已有持久消息编号"
 [ "$ASK" = 1 ] && [ -n "$REPLY_CORR" ] && die "--ask 与 --reply 不能同时使用"
 
-row=$(resolve "$TARGET")
-ref=$(printf '%s' "$row" | cut -d'|' -f1)
-win=$(printf '%s' "$row" | cut -d'|' -f2); win="${win:-window:1}"
-tgt_title=$(printf '%s' "$row" | cut -d'|' -f4)
+row=$(resolve "$TARGET") || exit $?
+ref=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ref"])' "$row")
+win=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["window"])' "$row")
+tgt_title=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["title"])' "$row")
 
 # 防自发自收(误把自己当目标)。SEND_SELF_OK=1 是 watch.sh 的专用旁路——
 # watcher 进程继承了本会话身份,给"自己"注入唤醒消息是故意行为。
@@ -305,13 +266,12 @@ esac
 # ── 来源前缀:不带来源的注入消息,对方无法与真人指令区分 ──────────────────────
 # 斜杠命令是指令不是聊天,加了前缀就不再是斜杠命令(变成 "(from x) /cmd"),必须跳过。
 case "$MSG" in /*) ADD_FROM=0 ;; esac
-from=${CMUX_FROM:-$(self_title || true)}
+from=$(python3 "$SCRIPT_DIR/protocol.py" source "$MESSAGE_ID") || exit $?
 
 if [ "$DURABLE" = 1 ]; then
   if [ "$DRY" = 1 ]; then
     echo "目标: $ref ($win, $tgt_title)"; echo "持久消息正文: $MSG"; exit 0
   fi
-  from=${from:-codex-external}
   if [ -n "$MESSAGE_ID" ]; then
     MESSAGE_ID=$(python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "$from" "$MSG" "$MESSAGE_ID")
   else

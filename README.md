@@ -140,6 +140,8 @@ cmux workspace-action --action rename --title "demo-project"   # 整个 tab 组
 
 来源名称取实际会话标题，不能按角色或仓库名自行补 `-be` / `-fe`。有真实 caller 时默认使用自动来源，不设置 `CMUX_FROM` 覆盖。`caller=null` 不等于来源名称未知：用户或会话上下文已明确来源，或当前仓库路径、注册表映射与现场唯一会话一致时，可通过 `CMUX_FROM` 使用实际会话名。例如已明确来源是 `aimeter`，就显示 `(from aimeter)`；外部进程信息写入 brief。只有缺少或无法消除来源歧义时才使用“来源未识别（外部进程）”。显示标签不赋予 caller 或 ACK 身份。
 
+新消息的 `CMUX_FROM` 与真实 caller 冲突，或通过 `CMUX_FROM_LABEL` 给普通消息改名时，退出 4，并在消息落盘和发送前停止。监听器展示标签继续显示“监听器 / 被监控对象”；旧消息和既有监听事件保留原 sender。
+
 **3. 长消息写文件,只发一行指针。** 长消息会 wrap 成多行,结尾的 `\r` 只提交最后一个可视行,其余留箱。发 brief、评审意见、任何含代码或 markdown 的载荷,一律:
 
 ```bash
@@ -182,6 +184,7 @@ messaging-cmux-sessions/
 └── tests/
     ├── test_send.py                # 模拟 cmux 的发送与协议回归测试
     ├── test_protocol.py            # 外部进程只读消息与接收身份边界测试
+    ├── test_routing.py             # 完整会话定位、特殊标题与来源冲突测试
     ├── test_delivery_wait.py       # 原编号投递等待与安全重试测试
     └── test_task_watch.py          # 模拟 cmux 的任务监听与通知测试
 ```
@@ -245,6 +248,7 @@ watcher 只有在确认投递成功时删除唤醒记录，读屏失败不会判
 ```bash
 python3 tests/test_send.py
 python3 tests/test_protocol.py
+python3 tests/test_routing.py
 python3 tests/test_delivery_wait.py
 python3 tests/test_task_watch.py
 ```
@@ -297,7 +301,7 @@ bash "$S/send.sh" --inbox
 
 接收确认必须来自记录中的目标 surface，且 workspace UUID、tty 与 surface 组成的目标身份仍匹配。cmux 重启或目标改变后，旧编号不能盲目路由到新目标。外部调用方可用 `CMUX_FROM` 标注来源、查询 `--status` 并读取约定的回复文件；不会冒用 focused 会话作为 caller。
 
-会话发现使用 `cmux --json tree --all`，需要 Python 3。当前数据缺失、格式异常或权限不足时直接报错，不回退到空列表。`send.sh --list` 的列格式保留兼容。
+会话发现使用 `cmux --json tree --all`，需要 Python 3。完整读取并验证后才匹配目标或输出清单；数据缺失、格式异常或权限不足时直接报错，不使用部分结果。目标匹配保留原始标题，重名仍拒绝。`send.sh --list` 保留列格式，特殊标题中的竖线、控制字符和反斜杠在展示时转义；定位用原始标题或明确的 surface。
 
 忙闲 hook 状态写入 `busy-v2/`，采用锁、原子替换及递增写入序号，绑定 workspace UUID、tty、surface。默认有效期 120 秒，可用 `CMUX_BUSY_TTL` 调整；旧格式、损坏、过期或身份不匹配均视为 unknown，再由调用方读取屏幕。序号表示加锁后的写入顺序，不能证明上游生命周期事件的发生顺序。现有 hooks 必须实际正常运行才能提供可靠状态；同一终端中重启 agent 但未改变 endpoint 的情况仍需生命周期正确清理，不能仅靠 endpoint 识别。
 
@@ -305,9 +309,13 @@ bash "$S/send.sh" --inbox
 
 ## 团队协作闭环
 
-持久发送返回 2/3 时立即用 `delivery-wait.py --id <原编号> --state <绝对路径>` 继续等待，不能只报告后结束。它绑定原 endpoint/sender/body，权限与陌生输入只观察；到期未送达用 `--resume` 核实续挂，身份漂移停止旧路由。派单未送达由协调者前台分段等候，每次最多60秒；已完成交付的执行方按[后台移交步骤](references/team-workflow.md#交付后移交通知观察)核实PID、首轮状态及日志后恢复接收新任务。协调者按已登记的任务路径回读产物，不等门铃才验收；deadline_at和exit_code使投递到期可观察，后台存在不等于保证自动唤醒。
+持久发送返回 2/3 时立即用 `delivery-wait.py --id <原编号> --state <绝对路径>` 继续等待，不能只报告后结束。它绑定原 endpoint/sender/body，权限与陌生输入只观察；到期未送达用 `--resume` 核实续挂，身份漂移停止旧路由。Codex 底栏识别支持 fast、上下文窗口提示和对齐的快捷键/告警文字；其它无法识别的行仍按陌生输入等待，不自动提交草稿。派单未送达由协调者前台分段等候，每次最多60秒；已完成交付的执行方按[后台移交步骤](references/team-workflow.md#交付后移交通知观察)核实PID、首轮状态及日志后恢复接收新任务。协调者按已登记的任务路径回读产物，不等门铃才验收；deadline_at和exit_code使投递到期可观察，后台存在不等于保证自动唤醒。
+
+其它业务回复不能自动取消仍有效的门铃投递。SIGINT 停止监听会记录 `status=stopped`、`stopped_at` 和 `exit_code=130`，恢复需核实后显式 `--resume`；停止不会清除输入框或修改原信箱的送达状态。
 
 有交付的派单默认附 task_id、仓库负责人、依赖、契约职责、产物和进度文件，并启动 `task-watch.py`。默认每 30 秒观察，5 分钟无进展提醒，2 小时监听到期；后台运行需核实 PID、首次状态及真实唤醒目标。已明确 blocked 时不额外制造 stalled；阻塞内容变化/解除会提醒，已恢复未送达告警保留历史并标为 superseded，抑制不等于送达。外部 caller=null 可显式 `--notify surface:N`，不冒充来源身份。
+
+进度文件仅刷新 `updated_at` 时算心跳，不重置无进展计时，也不解除停滞告警；状态、产物、摘要等实际内容变化才算进展。已有监听状态恢复时兼容旧签名，避免把签名格式迁移误认为新进展。
 
 监听区分权限等待、未交付的空闲、未知状态、会话身份变化和当次交付。通知只在状态变化时发送，失败沿用同消息编号重试。`completion_reported` 表示等待验收；协调者检查实际文件、diff 与跨项目契约后才标记 `accepted`。到期需要续挂或处理，不能当作任务完成。
 
