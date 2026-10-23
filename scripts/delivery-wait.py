@@ -98,7 +98,7 @@ def probe(data, target=None):
     for line in lines[index + 1:]:
         if line.strip() and not re.fullmatch(FOOTER, line, re.IGNORECASE):
             return 'foreign_input'
-    notice = '请查 cmux 收件箱：' + data['id']
+    notice = protocol.notice_text(data)
     if re.fullmatch(r'(?:\(from [^()\r\n]+\) )?' + re.escape(notice), text):
         return 'owned'
     return 'empty' if text in PLACEHOLDERS else 'foreign_input'

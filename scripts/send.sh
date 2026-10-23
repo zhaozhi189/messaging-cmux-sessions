@@ -28,6 +28,7 @@
 # <目标> 可以是:注册表别名 | tab 标题(精确)| 标题子串(唯一时)| surface:N
 #
 # 选项:
+#   --summary     持久消息的简短摘要；省略时自动从正文提取
 #   --retry       已有持久编号的安全重试，通常由 delivery-wait.py 调用
 #   --no-from     不自动添加 "(from <本会话>)" 来源前缀(以 / 开头的斜杠命令自动不加)
 #   --dry-run     只解析定位与最终消息,不真的发送
@@ -93,7 +94,7 @@ fi
 TARGET="$1"; shift
 [ $# -ge 1 ] || die "缺少消息文本"
 
-ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""; PEEK=0; DURABLE=0; MESSAGE_ID=""; RETRY=0
+ADD_FROM=1; DRY=0; MSG=""; FLUSH_SIG=""; ASK=0; REPLY_CORR=""; PEEK=0; DURABLE=0; MESSAGE_ID=""; RETRY=0; SUMMARY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --flush)   FLUSH_SIG="${2:-}"; [ -n "$FLUSH_SIG" ] || die "--flush 缺少签名参数"; shift 2 ;;
@@ -103,6 +104,7 @@ while [ $# -gt 0 ]; do
     --durable) DURABLE=1; shift ;;
     --retry) RETRY=1; shift ;;
     --id) MESSAGE_ID="${2:-}"; [ -n "$MESSAGE_ID" ] || die "--id 缺少编号"; shift 2 ;;
+    --summary) SUMMARY="${2:-}"; [ -n "$SUMMARY" ] || die "--summary 缺少摘要"; shift 2 ;;
     --peek)    PEEK=1; shift ;;
     --reply)   REPLY_CORR="${2:-}"; [ -n "$REPLY_CORR" ] || die "--reply 缺少关联号参数"; shift 2 ;;
     *)         MSG="$1"; shift ;;
@@ -110,6 +112,7 @@ while [ $# -gt 0 ]; do
 done
 [ "$DURABLE" = 1 ] && { [ "$ASK" = 0 ] && [ -z "$REPLY_CORR" ] && [ "$PEEK" = 0 ] && [ -z "$FLUSH_SIG" ]; } || { [ "$DURABLE" = 0 ] || die "--durable 不与 ask/reply/peek/flush 混用"; }
 [ -z "$MESSAGE_ID" ] || [ "$DURABLE" = 1 ] || die "--id 只用于 --durable"
+[ -z "$SUMMARY" ] || [ "$DURABLE" = 1 ] || die "--summary 只用于 --durable"
 [ "$RETRY" = 0 ] || { [ "$DURABLE" = 1 ] && [ -n "$MESSAGE_ID" ]; } || die "--retry 仅用于已有持久消息编号"
 [ "$ASK" = 1 ] && [ -n "$REPLY_CORR" ] && die "--ask 与 --reply 不能同时使用"
 
@@ -193,7 +196,7 @@ if [ "$RETRY" = 1 ]; then
   case "$action" in
     notified|received|completed) echo "已有通知或接收记录，停止重试"; exit 0 ;;
     empty|owned)
-      python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "${CMUX_FROM:-codex-external}" "$MSG" "$MESSAGE_ID" >/dev/null || exit 6
+      python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "${CMUX_FROM:-codex-external}" "$MSG" "$MESSAGE_ID" "$SUMMARY" >/dev/null || exit 6
       ;;
     session_changed) echo "目标身份已改变，停止旧路由" >&2; exit 6 ;;
     *) echo "投递继续等待：$action"; exit 2 ;;
@@ -268,21 +271,32 @@ esac
 case "$MSG" in /*) ADD_FROM=0 ;; esac
 from=$(python3 "$SCRIPT_DIR/protocol.py" source "$MESSAGE_ID") || exit $?
 
+disp_width() { python3 "$SCRIPT_DIR/protocol.py" width -- "$1"; }
+# 状态栏和分隔线的最大显示宽度用于估算终端宽度，不取正文中的第一条分隔线。
+term_cols=$(read_tail 15 | python3 "$SCRIPT_DIR/protocol.py" width) || term_cols=100
+[ "${term_cols:-0}" -lt 60 ] && term_cols=100
+SAFE_COLS=$((term_cols - 8))
+
 if [ "$DURABLE" = 1 ]; then
+  notice_cols=$SAFE_COLS
+  if [ "${SEND_MAXCHARS:-0}" -gt 0 ] && [ "$SEND_MAXCHARS" -lt "$notice_cols" ]; then
+    notice_cols=$SEND_MAXCHARS
+  fi
+  if [ "$ADD_FROM" = 1 ] && [ -n "$from" ]; then
+    notice_cols=$((notice_cols - $(disp_width "(from ${CMUX_FROM_LABEL:-$from}) ")))
+  fi
   if [ "$DRY" = 1 ]; then
-    echo "目标: $ref ($win, $tgt_title)"; echo "持久消息正文: $MSG"; exit 0
-  fi
-  if [ -n "$MESSAGE_ID" ]; then
-    MESSAGE_ID=$(python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "$from" "$MSG" "$MESSAGE_ID")
+    echo "持久通知预览（未落盘；未指定 --id 时使用占位编号）"
+    MSG=$(python3 "$SCRIPT_DIR/protocol.py" notice "${MESSAGE_ID:-m00000000000000000000000000000000}" "$MSG" "$SUMMARY" "$notice_cols")
   else
-    MESSAGE_ID=$(python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "$from" "$MSG")
+    MESSAGE_ID=$(python3 "$SCRIPT_DIR/protocol.py" enqueue "$ref" "$from" "$MSG" "$MESSAGE_ID" "$SUMMARY" "$notice_cols")
+    echo "消息已落盘: ${MESSAGE_ID}；重试必须沿用 --id 和原正文，不能重复派活。"
+    status=$(python3 "$SCRIPT_DIR/protocol.py" status "$MESSAGE_ID")
+    if printf '%s' "$status" | grep -qE '"state": "(notified|received|completed)"'; then
+      echo "已有通知或接收记录，不再发送通知；可用 --status 查询"; exit 0
+    fi
+    MSG=$(python3 "$SCRIPT_DIR/protocol.py" notice "$MESSAGE_ID")
   fi
-  echo "消息已落盘: ${MESSAGE_ID}；重试必须沿用 --id 和原正文，不能重复派活。"
-  status=$(python3 "$SCRIPT_DIR/protocol.py" status "$MESSAGE_ID")
-  if printf '%s' "$status" | grep -qE '"state": "(notified|received|completed)"'; then
-    echo "已有通知或接收记录，不再发送通知；可用 --status 查询"; exit 0
-  fi
-  MSG="请查 cmux 收件箱：$MESSAGE_ID"
 fi
 
 # --ask/--reply 的结构化标记依赖来源身份(对方要知道回给谁/消谁的账)。
@@ -318,6 +332,7 @@ fi
 # 前缀本身不能当签名——同一发送方的每条消息前缀都一样,会互相误判;
 # 所以签名长度 = 前缀长度 + 正文前 12 个字符，按 Unicode 字符截取。
 SIG=$(python3 -c 'import sys; print(sys.argv[1][:int(sys.argv[2])])' "$MSG" "$((PRELEN + 12))")
+[ "$DURABLE" = 0 ] || SIG="$MSG"
 
 # ── ⭐ 长度闸门:超长消息必然 wrap,而 wrap 会同时打破两条验证前提 ────────────────
 #    ① 签名假设「必落在 ❯ 那一行内」——箱里已堆着上一条时,本条签名落在中间行;
@@ -327,29 +342,8 @@ SIG=$(python3 -c 'import sys; print(sys.argv[1][:int(sys.argv[2])])' "$MSG" "$((
 # 单位必须是「显示列宽」而不是字符数:终端按列换行,而中文/全角字符占 2 列。
 # 按字符数判会系统性低估——实测一条 153 字符的消息实际占 159 列,在 149 列宽的终端
 # 里必然 wrap,却轻松通过了 260 的字符数闸门,于是退出码 0 而消息卡箱(2026-08-29 踩)。
-disp_width() { LC_ALL=en_US.UTF-8 python3 -c '
-import sys, unicodedata
-m = sys.argv[1]
-print(sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in m))
-' "$1" 2>/dev/null || printf '%s' "$1" | LC_ALL=en_US.UTF-8 wc -m | tr -d " "; }
-
-# 阈值取目标终端的真实宽度,不用固定值:固定 260 差不多是常见终端宽度的 1.7 倍,
-# 等于把「保证换行」的区间(宽度~260)整段放行了。
-#
-# 宽度取屏幕末尾若干行的最大显示宽度:底部的分隔线与状态栏总是铺满整宽。
-# 不要用「第一条 ──── 的长度」——输出里嵌套的表格/框也画分隔线,长度五花八门
-# (实测同屏出现过 84 / 132 / 444),取到哪条全看运气,会把阈值压到 40 几列而误拒。
-term_cols=$(read_tail 15 | LC_ALL=en_US.UTF-8 python3 -c '
-import sys, unicodedata
-w = 0
-for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
-    n = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line.rstrip())
-    w = max(w, n)
-print(w)
-' 2>/dev/null) || term_cols=100
-[ "${term_cols:-0}" -lt 60 ] && term_cols=100      # 读不到/异常窄就取保守值,宁可误拒不可漏放
-SAFE_COLS=$((term_cols - 8))                        # 留出提示符与光标的余量
 MSGCHARS=$(disp_width "$MSG")
+case "$MSGCHARS" in ''|*[!0-9]*) die "无法确认消息显示宽度，拒绝发送" ;; esac
 if [ "${SEND_MAXCHARS:-$SAFE_COLS}" -gt 0 ] && [ "$MSGCHARS" -gt "${SEND_MAXCHARS:-$SAFE_COLS}" ]; then
   cat >&2 <<EOF
 ✗ 消息过宽($MSGCHARS 显示列 > ${SEND_MAXCHARS:-$SAFE_COLS} 可用列,目标终端宽 ${term_cols}),拒绝发送——

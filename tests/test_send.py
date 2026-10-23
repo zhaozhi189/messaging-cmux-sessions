@@ -58,7 +58,7 @@ elif cmd=='send':
     data=json.loads(path.read_text())
     assert data['state']=='notified' and data['body']=='多行正文\n第二行',(data,result.stdout,result.stderr)
     calls=(d/'calls').read_text()
-    assert '多行正文' not in calls and 'mtest' in calls
+    assert '[多行正文]' in calls and '第二行' not in calls and 'mtest' in calls
     result=subprocess.run(command,env=env,text=True,errors='replace',capture_output=True)
     assert result.returncode==0 and (d/'calls').read_text()==calls
     for option in ['--complete','--ack']:

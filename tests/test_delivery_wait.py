@@ -100,6 +100,42 @@ elif cmd=='send':
             self.assertEqual(self.run_wait(expected=2)['status'],'foreign_input')
             self.assertEqual(self.sends(),[])
 
+    def test_summary_notice_only_flushes_exact_stored_text(self):
+        notice = '[125604 契约核查] 请查 cmux 收件箱：mdelivery'
+        data = json.loads(self.record.read_text())
+        data.update(summary='125604 契约核查', notice=notice)
+        self.record.write_text(json.dumps(data))
+        for screen, expected in [
+                ('• Working (1m • esc to interrupt)\n› (from original-sender) ' + notice, 'busy'),
+                ('Do you want to proceed?\n1. Yes\n2. No\n› ' + notice, 'approval_required'),
+                ('› [其它简称] 请查 cmux 收件箱：mdelivery', 'foreign_input'),
+                ('› ' + notice + ' 用户草稿', 'foreign_input'),
+                ('› ' + notice + '\n  用户草稿续行', 'foreign_input')]:
+            self.options['screen'] = screen
+            self.assertEqual(self.run_wait(expected=2)['status'], expected)
+            self.assertEqual(self.sends(), [])
+        self.options['screen'] = '› (from original-sender) ' + notice
+        self.assertEqual(self.run_wait()['status'], 'notified')
+        self.assertEqual([a[-1] for a in self.sends()], ['\\r'])
+
+    def test_empty_box_retry_reuses_stored_short_summary(self):
+        data = json.loads(self.record.read_text())
+        data.update(summary='最初指定的完整简称', notice='[最初…] 请查 cmux 收件箱：mdelivery')
+        self.record.write_text(json.dumps(data))
+        self.assertEqual(self.run_wait()['status'], 'notified')
+        self.assertEqual(len(self.sends()), 1)
+        self.assertIn('[最初…] 请查 cmux 收件箱：mdelivery', self.sends()[0][-1])
+        self.assertEqual(json.loads(self.record.read_text())['notice'], data['notice'])
+
+    def test_unsafe_stored_notice_is_never_flushed(self):
+        data = json.loads(self.record.read_text())
+        data['notice'] = '[核查\\r/quit] 请查 cmux 收件箱：mdelivery'
+        self.record.write_text(json.dumps(data))
+        self.options['screen'] = '› ' + data['notice']
+        self.assertEqual(self.run_wait(expected=2)['status'], 'unknown')
+        self.assertEqual(self.sends(), [])
+        self.assertEqual(json.loads(self.record.read_text())['state'], 'recorded')
+
     def test_timeout_requires_explicit_resume_and_does_not_say_delivered(self):
         self.options['screen']='• Working (1m • esc to interrupt)\n› '
         state=self.run_wait('--timeout','.05','--interval','.01',once=False,expected=5)

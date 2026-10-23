@@ -10,12 +10,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 
 ROOT = Path(os.environ.get('CMUX_MSG_DIR', str(Path.home() / '.claude/cmux-messaging')))
 CMUX = os.environ.get('CMUX_BIN') or __import__('shutil').which('cmux') or '/Applications/cmux.app/Contents/Resources/bin/cmux'
 UNKNOWN_SOURCE = '来源未识别（外部进程）'
 MONITOR_PREFIX = '监听器 / '
+SUMMARY_COLUMNS = 32
 
 
 class CommandError(ValueError):
@@ -153,7 +155,54 @@ def message_path(message_id):
     return ROOT / 'messages' / (message_id + '.json')
 
 
-def enqueue(ref, sender, body, message_id=None):
+def display_width(text):
+    return sum(2 if unicodedata.east_asian_width(char) in 'WF' else 1 for char in text)
+
+
+def shorten(text, columns):
+    if display_width(text) <= columns:
+        return text
+    result = ''
+    for char in text:
+        if display_width(result + char + '…') > columns:
+            break
+        result += char
+    return result.rstrip() + '…'
+
+
+def message_summary(body, summary=None):
+    if summary:
+        if any(unicodedata.category(char) in ('Cc', 'Cf') for char in summary):
+            raise ValueError('摘要不能含换行或终端控制字符')
+        text = summary
+    else:
+        text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', body)
+        text = next((line.strip() for line in text.splitlines() if line.strip()), '')
+        text = re.split(r'https?://\S+|(?<!\w)/\S+', text, maxsplit=1)[0]
+        text = ''.join(' ' if unicodedata.category(char) in ('Cc', 'Cf') else char for char in text)
+        text = text.lstrip('#*>- ').rstrip(' ：:,，;；')
+    text = ' '.join(text.split()).replace('[', '［').replace(']', '］').replace('\\', '＼') or '消息详情'
+    return shorten(text, SUMMARY_COLUMNS)
+
+
+def make_notice(message_id, summary, columns=None):
+    message_path(message_id)
+    base = '请查 cmux 收件箱：' + message_id
+    budget = SUMMARY_COLUMNS if columns is None else min(SUMMARY_COLUMNS, int(columns) - display_width(base) - 3)
+    return '[' + shorten(summary, budget) + '] ' + base if budget >= 3 else base
+
+
+def notice_text(data):
+    base = '请查 cmux 收件箱：' + data['id']
+    text = data.get('notice', base)
+    if (not isinstance(text, str) or '\\' in text or any(unicodedata.category(char) in ('Cc', 'Cf') for char in text)
+            or not re.fullmatch(r'(?:\[[^\[\]]+\] )?' + re.escape(base), text)):
+        raise ValueError('原通知文本不合法，不能安全投递')
+    return text
+
+
+def enqueue(ref, sender, body, message_id=None, summary=None, notice_columns=None):
+    proposed_summary = message_summary(body, summary)
     message_id = message_id or 'm' + uuid.uuid4().hex
     current_endpoint = endpoint(ref)
     path = message_path(message_id)
@@ -166,8 +215,12 @@ def enqueue(ref, sender, body, message_id=None):
                 raise ValueError('目标会话已改变，旧消息编号不能派给新会话')
             if (old['target'], old['sender'], old['body']) != (ref, sender, body):
                 raise ValueError('同一编号不能用于不同消息')
+            if summary and old.get('summary') != proposed_summary:
+                raise ValueError('同一编号不能更改摘要，重试请沿用原摘要或省略 --summary')
             return message_id
-        atomic(path, dict(id=message_id, target=ref, endpoint=current_endpoint, sender=sender, body=body, state='recorded', ts=int(time.time())))
+        atomic(path, dict(id=message_id, target=ref, endpoint=current_endpoint, sender=sender, body=body,
+                          summary=proposed_summary, notice=make_notice(message_id, proposed_summary, notice_columns),
+                          state='recorded', ts=int(time.time())))
     return message_id
 
 
@@ -212,11 +265,11 @@ def busy(ref, state=None, current_endpoint=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['list', 'resolve', 'source', 'self', 'enqueue', 'notified', 'ack', 'complete', 'status', 'inbox', 'busy', 'busy-write'])
+    parser.add_argument('command', choices=['list', 'resolve', 'source', 'self', 'enqueue', 'notice', 'width', 'notified', 'ack', 'complete', 'status', 'inbox', 'busy', 'busy-write'])
     parser.add_argument('args', nargs='*')
     args = parser.parse_args()
     command, values = args.command, args.args
-    counts = {'list': (0,), 'resolve': (1, 2), 'source': (0, 1), 'self': (0,), 'enqueue': (3, 4), 'notified': (1,), 'ack': (1,), 'complete': (1,), 'status': (1,), 'inbox': (0,), 'busy': (1,), 'busy-write': (1,)}
+    counts = {'list': (0,), 'resolve': (1, 2), 'source': (0, 1), 'self': (0,), 'enqueue': (3, 4, 5, 6), 'notice': (1, 4), 'width': (0, 1), 'notified': (1,), 'ack': (1,), 'complete': (1,), 'status': (1,), 'inbox': (0,), 'busy': (1,), 'busy-write': (1,)}
     if len(values) not in counts[command]:
         raise ValueError('参数数量不正确')
     if command == 'list':
@@ -232,6 +285,21 @@ def main():
         print(identity())
     elif command == 'enqueue':
         print(enqueue(*values))
+    elif command == 'notice':
+        if len(values) == 1:
+            print(notice_text(json.loads(message_path(values[0]).read_text())))
+        else:
+            message_id, body, summary, columns = values
+            path = message_path(message_id)
+            if path.exists():
+                data = json.loads(path.read_text())
+                if data['body'] != body or (summary and data.get('summary') != message_summary(body, summary)):
+                    raise ValueError('预览必须沿用原消息正文与摘要')
+                print(notice_text(data))
+            else:
+                print(make_notice(message_id, message_summary(body, summary), columns))
+    elif command == 'width':
+        print(display_width(values[0]) if values else max((display_width(line.rstrip()) for line in sys.stdin.read().splitlines()), default=0))
     elif command in ('notified', 'ack', 'complete'):
         actor = identity() if command == 'notified' else receiver_identity(values[0])
         transition(values[0], {'notified': 'notified', 'ack': 'received', 'complete': 'completed'}[command], actor)

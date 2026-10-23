@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import unicodedata
 import unittest
 
 
@@ -39,7 +40,7 @@ elif args == ['identify']:
     print(json.dumps({'caller':{'surface_ref':caller} if caller else None,
                       'focused':{'surface_ref':'surface:2'}}))
 elif args[0] == 'read-screen':
-    print('─' * 240)
+    print('─' * config.get('columns', 240))
     print('› ' if (root / 'sent').exists() else '› Ask Codex to do anything')
 elif args[0] == 'send':
     with (root / 'sends.jsonl').open('a') as stream:
@@ -155,6 +156,126 @@ else:
                 result = self.run_send('surface:2', 'hello', CMUX_FROM=value)
                 self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
                 self.assertFalse((self.directory / 'sends.jsonl').exists())
+
+    def test_durable_notice_has_auto_summary_and_preserves_full_body(self):
+        body = '接口核查已完成\n详细计划和代码见共享文件'
+        result = self.run_send('surface:2', '--durable', '--id', 'msummary', body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads((self.directory / 'state/messages/msummary.json').read_text())
+        self.assertEqual(data['body'], body)
+        self.assertEqual(data['summary'], '接口核查已完成')
+        self.assertEqual(data['notice'], '[接口核查已完成] 请查 cmux 收件箱：msummary')
+        calls = (self.directory / 'sends.jsonl').read_text()
+        self.assertIn('[接口核查已完成]', calls)
+        self.assertNotIn('详细计划', calls)
+
+    def test_explicit_summary_is_frozen_on_retry(self):
+        body = '请读 /private/tmp/contract.md'
+        args = ('surface:2', '--durable', '--id', 'mcustom', body)
+        result = self.run_send(*args, '--summary', '125604 契约核查')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        path = self.directory / 'state/messages/mcustom.json'
+        data = json.loads(path.read_text())
+        self.assertEqual(data['summary'], '125604 契约核查')
+        data['state'] = 'recorded'
+        path.write_text(json.dumps(data))
+        before = path.read_bytes()
+        calls = (self.directory / 'sends.jsonl').read_bytes()
+        result = self.run_send(*args, '--summary', '其它需求')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((self.directory / 'sends.jsonl').read_bytes(), calls)
+        result = self.run_send(*args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(path.read_text())['notice'], data['notice'])
+
+    def test_narrow_notice_shortens_summary_but_keeps_full_id(self):
+        self.options['columns'] = 90
+        identifier = 'm' + 'a' * 32
+        result = self.run_send('surface:2', '--durable', '--id', identifier, '这是需要核对的完整后端接口契约与业务边界')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads((self.directory / ('state/messages/' + identifier + '.json')).read_text())
+        notice = '(from aimeter) ' + data['notice']
+        width = sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in notice)
+        self.assertLessEqual(width, 82)
+        self.assertIn(identifier, notice)
+        self.assertTrue(data['notice'].startswith('['))
+        self.assertNotIn('完整后端', data['notice'])
+
+    def test_fixed_notice_is_not_rewritten_when_window_shrinks(self):
+        identifier = 'm' + 'b' * 32
+        body = '需要核查的后端接口契约及状态映射'
+        result = self.run_send('surface:2', '--durable', '--id', identifier, body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        path = self.directory / ('state/messages/' + identifier + '.json')
+        data = json.loads(path.read_text())
+        data['state'] = 'recorded'
+        path.write_text(json.dumps(data))
+        before = path.read_bytes()
+        calls = (self.directory / 'sends.jsonl').read_bytes()
+        self.options['columns'] = 90
+        result = self.run_send('surface:2', '--durable', '--id', identifier, body)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((self.directory / 'sends.jsonl').read_bytes(), calls)
+
+    def test_auto_summary_omits_paths_and_terminal_controls(self):
+        for index, body in enumerate(['/private/tmp/sensitive-detail.md', '\x1b[31m接口已就绪\x1b[0m\n详细正文']):
+            result = self.run_send('surface:2', '--durable', '--id', 'mauto' + str(index), body)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads((self.directory / ('state/messages/mauto' + str(index) + '.json')).read_text())
+            self.assertEqual(data['body'], body)
+            self.assertEqual(data['summary'], ['消息详情', '接口已就绪'][index])
+            self.assertNotIn('\x1b', data['notice'])
+            self.assertNotIn('/private/tmp', data['notice'])
+
+    def test_summary_controls_and_non_durable_option_are_rejected(self):
+        for args in [('--durable', '--summary', '核查\n回车', '正文'),
+                     ('--durable', '--summary', '核查\x1b[31m', '正文'),
+                     ('--summary', '简称', '正文')]:
+            with self.subTest(args=args):
+                result = self.run_send('surface:2', *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.directory / 'sends.jsonl').exists())
+                self.assertFalse(list((self.directory / 'state/messages').glob('*.json')))
+
+    def test_summary_literal_escapes_never_become_cmux_keys(self):
+        for index, (body, extra) in enumerate([
+                (r'核查\r/quit', ()),
+                ('完整正文', ('--summary', r'核查\n下一行\tTab'))]):
+            result = self.run_send('surface:2', '--durable', '--id', 'mescape' + str(index), body, *extra)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads((self.directory / ('state/messages/mescape' + str(index) + '.json')).read_text())
+            self.assertNotIn('\\', data['notice'])
+            self.assertIn('＼', data['notice'])
+            self.assertEqual(data['body'], body)
+        for args in map(json.loads, (self.directory / 'sends.jsonl').read_text().splitlines()):
+            payload = args[-1][:-2]
+            for sequence in ('\\r', '\\n', '\\t'):
+                self.assertNotIn(sequence, payload)
+
+    def test_leading_hyphen_cannot_bypass_width_guard(self):
+        result = self.run_send('surface:2', '--no-from', '-h' + 'x' * 300)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertFalse((self.directory / 'sends.jsonl').exists())
+
+    def test_durable_dry_run_previews_summary_without_creating_record(self):
+        result = self.run_send('surface:2', '--durable', '--summary', '契约核查', '--dry-run', '请阅读 /private/tmp/brief.md')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('[契约核查] 请查 cmux 收件箱：', result.stdout)
+        self.assertFalse((self.directory / 'state').exists())
+
+    def test_existing_record_preview_keeps_legacy_notice(self):
+        path = self.directory / 'state/messages/mlegacy.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(dict(id='mlegacy', target='surface:2', endpoint='gen1|t2|surface:2',
+            sender='aimeter', body='旧消息正文', state='recorded', ts=1)))
+        before = path.read_bytes()
+        result = self.run_send('surface:2', '--durable', '--id', 'mlegacy', '--dry-run', '旧消息正文')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('(from aimeter) 请查 cmux 收件箱：mlegacy', result.stdout)
+        self.assertNotIn('[旧消息正文]', result.stdout)
+        self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == '__main__':
